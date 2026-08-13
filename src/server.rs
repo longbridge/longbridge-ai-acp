@@ -272,6 +272,7 @@ pub fn acp_agent<B: AgentBackend>(
     let cancel_sessions = Arc::clone(&sessions);
     let list_backend = Arc::clone(&backend);
     let load_backend = Arc::clone(&backend);
+    let new_backend = Arc::clone(&backend);
     Agent
         .builder()
         .name("longbridge-ai")
@@ -327,8 +328,8 @@ pub fn acp_agent<B: AgentBackend>(
                 new_sessions.write().await.insert(
                     id.clone(),
                     SessionRecord {
+                        state: new_backend.new_session(id.0.as_ref(), &request.cwd),
                         cwd: request.cwd,
-                        state: B::Session::default(),
                         cancel: tokio::sync::watch::channel(0).0,
                     },
                 );
