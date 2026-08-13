@@ -375,7 +375,7 @@ fn validate_table(table: &Table) -> Result<(), RichContentError> {
     Ok(())
 }
 
-fn chart_markdown_fallback(data: &Value) -> String {
+pub(crate) fn chart_markdown_fallback(data: &Value) -> String {
     let title = data.get("title").and_then(Value::as_str);
     let rows = data.get("data").and_then(Value::as_array);
     let Some(rows) = rows.filter(|rows| !rows.is_empty()) else {

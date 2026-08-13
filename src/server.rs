@@ -1,4 +1,4 @@
-use crate::{AgentBackend, AgentEvent, RichContent};
+use crate::{rich_content::chart_markdown_fallback, AgentBackend, AgentEvent, RichContent};
 use agent_client_protocol::schema::{
     v1::{
         AgentCapabilities, CancelNotification, ContentBlock, ContentChunk, Implementation,
@@ -908,13 +908,22 @@ impl RichTextFilter {
                 }
                 continue;
             }
-            match serde_json::from_str(body.trim()).ok().and_then(|data| {
-                RichContent::chart(
-                    format!("{}:chart-{}", self.content_id_prefix, self.next_chart),
-                    data,
-                )
-                .ok()
-            }) {
+            let parsed = serde_json::from_str::<serde_json::Value>(body.trim()).ok();
+            let content_id = format!("{}:chart-{}", self.content_id_prefix, self.next_chart);
+            let chart = parsed.and_then(|data| {
+                RichContent::chart(content_id.clone(), data.clone())
+                    .or_else(|_| {
+                        RichContent::opaque(
+                            content_id,
+                            crate::RichContentKind::Chart,
+                            crate::CHART_MIME_TYPE,
+                            data.clone(),
+                            chart_markdown_fallback(&data),
+                        )
+                    })
+                    .ok()
+            });
+            match chart {
                 Some(chart) => {
                     self.next_chart += 1;
                     output.push(FilteredContent::Rich(chart));
@@ -988,7 +997,8 @@ fn widget_src(tag: &str) -> Option<String> {
 }
 
 fn widget_fallback(uri: &str) -> String {
-    let symbols = widget_query_values(uri, "symbols");
+    let mut symbols = widget_query_values(uri, "symbols");
+    symbols.extend(widget_query_values(uri, "tickers"));
     if !symbols.is_empty() {
         return symbols
             .iter()
@@ -997,6 +1007,9 @@ fn widget_fallback(uri: &str) -> String {
             .join(" · ");
     }
     if let Some(symbol) = widget_query_values(uri, "symbol").first() {
+        return stock_markdown_link(symbol);
+    }
+    if let Some(symbol) = widget_query_values(uri, "ticker").first() {
         return stock_markdown_link(symbol);
     }
     if let Some(counter_id) = widget_query_values(uri, "counter_id").first() {
@@ -1447,6 +1460,36 @@ mod tests {
                 "[GM.US](https://longbridge.com/quote/gm.us)"
             )
         );
+    }
+
+    #[test]
+    fn stock_and_signal_widgets_use_public_security_links() {
+        for (source, symbol) in [
+            ("widget://stock/basic?tickers=TSLA.US", "TSLA.US"),
+            ("widget://signal/latest?ticker=AAPL.US", "AAPL.US"),
+        ] {
+            let mut filter = RichTextFilter::new("session-1");
+            let output = filter.push(&format!("<x-widget src=\"{source}\" />"));
+            let FilteredContent::Rich(widget) = &output[0] else {
+                panic!("expected widget");
+            };
+            assert_eq!(widget.fallback, stock_markdown_link(symbol));
+        }
+    }
+
+    #[test]
+    fn unknown_chart_type_degrades_to_table_without_raw_fence() {
+        let mut filter = RichTextFilter::new("session-1");
+        let output = filter.push(
+            "```vis-chart\n{\"type\":\"future-chart\",\"data\":[{\"category\":\"A\",\"value\":3}]}\n```",
+        );
+        let FilteredContent::Rich(chart) = &output[0] else {
+            panic!("expected rich chart fallback");
+        };
+        assert_eq!(chart.kind, crate::RichContentKind::Chart);
+        assert!(chart.fallback.contains("| category | value |"));
+        assert!(!chart.fallback.contains("```vis-chart"));
+        assert_eq!(chart.data["type"], "future-chart");
     }
 
     #[test]
