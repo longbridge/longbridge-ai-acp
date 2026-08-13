@@ -15,18 +15,21 @@ private API adapters.
 
 ## Response compatibility
 
-The server emits two coordinated representations for provider-rich responses:
+The server preserves provider-rich responses in two layers:
 
-- standard ACP content for generic clients, including Markdown tables, safe SVG
-  images, public quote links, resource links, plans, tool progress, and session
-  titles;
+- one portable standard ACP representation for generic clients, using Markdown
+  tables and links alongside plans, tool progress, and session titles;
 - the exact provider event under `_meta["longbridge.ai/event"]` for Longbridge
   clients that reuse the existing Chat UI.
 
 Standard fallbacks paired with a native event are tagged with
 `longbridge.ai/standard-fallback`. Longbridge clients ignore those tagged
 blocks, while generic ACP clients ignore the namespaced native event. This
-prevents duplicate charts without reducing generic-client compatibility.
+prevents duplicate charts without reducing generic-client compatibility. ACP
+v1 does not define output MIME negotiation, so the server does not send several
+alternative representations and does not rely on a proprietary capability
+handshake. Longbridge clients reconstruct richer UI from the native event;
+other clients consistently receive the portable fallback.
 
 Streaming normalization currently covers `vis-chart`, `html-live`,
 `svg-inline`, `x-widget`, `[stock ...]`, and citation forms `[citation N]`,
