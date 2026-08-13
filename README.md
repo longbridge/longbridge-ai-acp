@@ -15,10 +15,10 @@ private API adapters.
 
 ## Response compatibility
 
-The server emits two coordinated representations for provider-rich responses:
+The server preserves provider-rich responses in two layers:
 
-- standard ACP content for generic clients, including Markdown tables, safe SVG
-  images, public quote links, resource links, plans, tool progress, and session
+- one standard ACP representation selected for the client's declared output
+  capabilities, plus public quote links, plans, tool progress, and session
   titles;
 - the exact provider event under `_meta["longbridge.ai/event"]` for Longbridge
   clients that reuse the existing Chat UI.
@@ -27,6 +27,26 @@ Standard fallbacks paired with a native event are tagged with
 `longbridge.ai/standard-fallback`. Longbridge clients ignore those tagged
 blocks, while generic ACP clients ignore the namespaced native event. This
 prevents duplicate charts without reducing generic-client compatibility.
+
+ACP v1 does not define output MIME negotiation. This crate therefore uses the
+ACP `_meta` extension point. A client that can display SVG sends the following
+metadata in `initialize`:
+
+```json
+{
+  "_meta": {
+    "longbridge.ai/content-capabilities": {
+      "contentTypes": ["image/svg+xml"]
+    }
+  }
+}
+```
+
+An SVG-capable client receives only the SVG preview for a supported chart. An
+unknown client receives only the Markdown/table fallback. The server never
+sends fallback and preview as adjacent chunks for the same rich object, because
+ACP clients may merge adjacent message chunks into one display block. Rich
+content without a representation supported by the client degrades to Markdown.
 
 Streaming normalization currently covers `vis-chart`, `html-live`,
 `svg-inline`, `x-widget`, `[stock ...]`, and citation forms `[citation N]`,
