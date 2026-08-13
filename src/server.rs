@@ -1158,6 +1158,27 @@ fn render_citation(
 fn completion_markdown(metadata: &serde_json::Value) -> Option<String> {
     let outputs = metadata.get("outputs").unwrap_or(metadata);
     let mut sections = Vec::new();
+    let error_code = metadata
+        .get("error_code")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or_default();
+    let status = metadata
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if error_code != 0 || matches!(status, "failed" | "error") {
+        let message = metadata
+            .get("error_message")
+            .and_then(serde_json::Value::as_str)
+            .filter(|message| !message.is_empty())
+            .unwrap_or("The workflow failed.");
+        let suffix = if error_code != 0 {
+            format!(" (error code {error_code})")
+        } else {
+            String::new()
+        };
+        sections.push(format!("> Workflow failed: {message}{suffix}"));
+    }
     if let Some(references) = outputs
         .get("references")
         .and_then(serde_json::Value::as_array)
@@ -1692,6 +1713,19 @@ mod tests {
             }
         }))
         .is_none());
+    }
+
+    #[test]
+    fn completion_failure_is_visible_to_generic_clients() {
+        let markdown = completion_markdown(&serde_json::json!({
+            "status": "failed",
+            "error_code": 401_004,
+            "error_message": "Authentication required",
+            "outputs": {}
+        }))
+        .expect("failure fallback");
+        assert!(markdown.contains("Workflow failed: Authentication required"));
+        assert!(markdown.contains("error code 401004"));
     }
 
     #[test]
