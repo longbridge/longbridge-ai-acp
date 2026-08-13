@@ -135,6 +135,14 @@ pub trait AgentBackend: Send + Sync + 'static {
     /// Whether this backend implements ACP `session/list` and `session/load`.
     const SESSION_HISTORY: bool = false;
 
+    /// Creates backend state for a newly assigned ACP session identifier.
+    ///
+    /// Backends that persist sessions can retain this identifier so a later
+    /// `session/load` request can resolve the same state after a restart.
+    fn new_session(&self, _session_id: &str, _cwd: &Path) -> Self::Session {
+        Self::Session::default()
+    }
+
     async fn list_sessions(
         &self,
         _cwd: Option<&Path>,
