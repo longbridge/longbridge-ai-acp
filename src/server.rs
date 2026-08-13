@@ -176,7 +176,7 @@ fn history_updates<Session>(
             event,
             data,
         } => vec![SessionUpdate::AgentMessageChunk(ContentChunk::new(
-            ContentBlock::Text(TextContent::new("").meta(extension_meta(namespace, event, data))),
+            ContentBlock::Text(TextContent::new("").meta(extension_meta(namespace, &event, &data))),
         ))],
         AgentEvent::NeedsInput {
             questions,
@@ -248,8 +248,8 @@ fn plan_status(status: &str) -> PlanEntryStatus {
 
 fn extension_meta(
     namespace: String,
-    event: String,
-    data: serde_json::Value,
+    event: &str,
+    data: &serde_json::Value,
 ) -> serde_json::Map<String, serde_json::Value> {
     let mut meta = serde_json::Map::new();
     meta.insert(
