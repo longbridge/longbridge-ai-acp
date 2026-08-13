@@ -19,9 +19,6 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 const BACKEND_INACTIVITY_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);
-pub const CONTENT_CAPABILITIES_META_KEY: &str = "longbridge.ai/content-capabilities";
-pub const CONTENT_TYPES_FIELD: &str = "contentTypes";
-pub const SVG_CONTENT_TYPE: &str = "image/svg+xml";
 
 struct SessionRecord<BackendSession> {
     cwd: std::path::PathBuf,
@@ -30,51 +27,6 @@ struct SessionRecord<BackendSession> {
 }
 
 type Sessions<BackendSession> = Arc<RwLock<HashMap<SessionId, SessionRecord<BackendSession>>>>;
-
-#[derive(Clone, Copy, Default, Eq, PartialEq)]
-struct OutputCapabilities {
-    svg: bool,
-}
-
-impl OutputCapabilities {
-    fn from_initialize(request: &InitializeRequest) -> Self {
-        let svg = request
-            .meta
-            .as_ref()
-            .and_then(|meta| meta.get(CONTENT_CAPABILITIES_META_KEY))
-            .and_then(|value| value.get(CONTENT_TYPES_FIELD))
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|types| {
-                types
-                    .iter()
-                    .any(|value| value.as_str() == Some(SVG_CONTENT_TYPE))
-            });
-        Self { svg }
-    }
-
-    fn rich_chunks(self, rich: &RichContent) -> Vec<ContentChunk> {
-        self.rich_chunks_with_meta(rich, None)
-    }
-
-    fn rich_chunks_with_meta(
-        self,
-        rich: &RichContent,
-        extra: Option<&serde_json::Map<String, serde_json::Value>>,
-    ) -> Vec<ContentChunk> {
-        let chunks = rich.to_acp_chunks_with_meta(extra);
-        if self.svg {
-            let image_index = chunks
-                .iter()
-                .position(|chunk| matches!(chunk.content, ContentBlock::Image(_)));
-            match image_index {
-                Some(index) => chunks.into_iter().skip(index).take(1).collect(),
-                None => chunks.into_iter().take(1).collect(),
-            }
-        } else {
-            chunks.into_iter().take(1).collect()
-        }
-    }
-}
 
 fn flatten_prompt(blocks: &[ContentBlock]) -> agent_client_protocol::Result<String> {
     blocks
@@ -93,15 +45,12 @@ fn flatten_prompt(blocks: &[ContentBlock]) -> agent_client_protocol::Result<Stri
 fn history_updates<Session>(
     event: AgentEvent<Session>,
     rich_text: &mut RichTextFilter,
-    output_capabilities: OutputCapabilities,
 ) -> Vec<SessionUpdate> {
     match event {
         AgentEvent::UserText(text) => vec![SessionUpdate::UserMessageChunk(ContentChunk::new(
             ContentBlock::Text(TextContent::new(text)),
         ))],
-        AgentEvent::Text(text) => {
-            filtered_history_updates(rich_text.push(&text), output_capabilities)
-        }
+        AgentEvent::Text(text) => filtered_history_updates(rich_text.push(&text)),
         AgentEvent::Thought(text) => vec![SessionUpdate::AgentThoughtChunk(ContentChunk::new(
             ContentBlock::Text(TextContent::new(text)),
         ))],
@@ -120,10 +69,7 @@ fn history_updates<Session>(
                 let mut updates = vec![SessionUpdate::AgentMessageChunk(ContentChunk::new(
                     ContentBlock::Text(TextContent::new("").meta(longbridge_meta(metadata))),
                 ))];
-                updates.extend(filtered_history_updates(
-                    rich_text.push(&text),
-                    output_capabilities,
-                ));
+                updates.extend(filtered_history_updates(rich_text.push(&text)));
                 updates
             }
         }
@@ -220,8 +166,8 @@ fn history_updates<Session>(
                     .meta(longbridge_meta(metadata)),
             )]
         }
-        AgentEvent::RichContent(rich) => output_capabilities
-            .rich_chunks(&rich)
+        AgentEvent::RichContent(rich) => rich
+            .to_acp_chunks()
             .into_iter()
             .map(SessionUpdate::AgentMessageChunk)
             .collect(),
@@ -265,10 +211,7 @@ fn history_updates<Session>(
     }
 }
 
-fn filtered_history_updates(
-    content: Vec<FilteredContent>,
-    output_capabilities: OutputCapabilities,
-) -> Vec<SessionUpdate> {
+fn filtered_history_updates(content: Vec<FilteredContent>) -> Vec<SessionUpdate> {
     content
         .into_iter()
         .flat_map(|item| match item {
@@ -277,8 +220,8 @@ fn filtered_history_updates(
                     ContentBlock::Text(TextContent::new(text)),
                 ))]
             }
-            FilteredContent::Rich(rich) => output_capabilities
-                .rich_chunks(&rich)
+            FilteredContent::Rich(rich) => rich
+                .to_acp_chunks()
                 .into_iter()
                 .map(SessionUpdate::AgentMessageChunk)
                 .collect(),
@@ -322,7 +265,6 @@ pub fn acp_agent<B: AgentBackend>(
 ) -> impl agent_client_protocol::component::ConnectTo<Client> {
     let backend = Arc::new(backend);
     let sessions: Sessions<B::Session> = Arc::new(RwLock::new(HashMap::new()));
-    let output_capabilities = Arc::new(RwLock::new(OutputCapabilities::default()));
 
     let new_sessions = Arc::clone(&sessions);
     let load_sessions = Arc::clone(&sessions);
@@ -331,9 +273,6 @@ pub fn acp_agent<B: AgentBackend>(
     let list_backend = Arc::clone(&backend);
     let load_backend = Arc::clone(&backend);
     let new_backend = Arc::clone(&backend);
-    let initialize_output_capabilities = Arc::clone(&output_capabilities);
-    let load_output_capabilities = Arc::clone(&output_capabilities);
-    let prompt_output_capabilities = Arc::clone(&output_capabilities);
     Agent
         .builder()
         .name("longbridge-ai")
@@ -355,8 +294,6 @@ pub fn acp_agent<B: AgentBackend>(
                             .data("only ACP protocol version 1 is supported"),
                     );
                 }
-                *initialize_output_capabilities.write().await =
-                    OutputCapabilities::from_initialize(&request);
                 let capabilities = if B::SESSION_HISTORY {
                     AgentCapabilities::new()
                         .load_session(true)
@@ -455,7 +392,6 @@ pub fn acp_agent<B: AgentBackend>(
                     }
                 };
                 let mut history = loaded.history;
-                let output_capabilities = *load_output_capabilities.read().await;
                 let mut rich_text = RichTextFilter::new(request.session_id.0.as_ref());
                 while let Some(event) = history.next().await {
                     let event = match event {
@@ -467,7 +403,7 @@ pub fn acp_agent<B: AgentBackend>(
                             );
                         }
                     };
-                    for update in history_updates(event, &mut rich_text, output_capabilities) {
+                    for update in history_updates(event, &mut rich_text) {
                         if let Err(error) = connection.send_notification(SessionNotification::new(
                             request.session_id.clone(),
                             update,
@@ -476,7 +412,7 @@ pub fn acp_agent<B: AgentBackend>(
                         }
                     }
                 }
-                for update in filtered_history_updates(rich_text.finish(), output_capabilities) {
+                for update in filtered_history_updates(rich_text.finish()) {
                     if let Err(error) = connection.send_notification(SessionNotification::new(
                         request.session_id.clone(),
                         update,
@@ -536,7 +472,6 @@ pub fn acp_agent<B: AgentBackend>(
                 );
                 let prompt_sessions = Arc::clone(&prompt_sessions);
                 let backend = Arc::clone(&backend);
-                let output_capabilities = Arc::clone(&prompt_output_capabilities);
                 let task_connection = connection.clone();
                 connection.spawn(async move {
                     let (cwd, state, mut cancelled) = {
@@ -561,7 +496,6 @@ pub fn acp_agent<B: AgentBackend>(
                     })?;
 
                     let mut stop_reason = StopReason::EndTurn;
-                    let output_capabilities = *output_capabilities.read().await;
                     let mut rich_text = RichTextFilter::new(request.session_id.0.as_ref());
                     let mut active_tools = HashMap::<String, String>::new();
                     loop {
@@ -623,7 +557,6 @@ pub fn acp_agent<B: AgentBackend>(
                                     &request.session_id,
                                     rich_text.push(&text),
                                     None,
-                                    output_capabilities,
                                 )?;
                             }
                             AgentEvent::Thought(text) => {
@@ -658,7 +591,6 @@ pub fn acp_agent<B: AgentBackend>(
                                         &request.session_id,
                                         rich_text.push(&text),
                                         Some(&standard_fallback_meta()),
-                                        output_capabilities,
                                     )?;
                                     continue;
                                 }
@@ -950,7 +882,7 @@ pub fn acp_agent<B: AgentBackend>(
                             }
                             AgentEvent::RichContent(content) => {
                                 tracing::debug!(target: "longbridge_ai_acp::protocol", session_id = %request.session_id.0, content_id = %content.content_id, kind = ?content.kind, update = "rich_content", "ACP rich content sent");
-                                for chunk in output_capabilities.rich_chunks(&content) {
+                                for chunk in content.to_acp_chunks() {
                                     task_connection.send_notification(SessionNotification::new(
                                         request.session_id.clone(),
                                         SessionUpdate::AgentMessageChunk(chunk),
@@ -1025,7 +957,6 @@ pub fn acp_agent<B: AgentBackend>(
                         &request.session_id,
                         rich_text.finish(),
                         None,
-                        output_capabilities,
                     )?;
                     tracing::info!(
                         target: "longbridge_ai_acp::protocol",
@@ -1687,7 +1618,6 @@ fn send_filtered_text(
     session_id: &SessionId,
     content: Vec<FilteredContent>,
     text_metadata: Option<&serde_json::Map<String, serde_json::Value>>,
-    output_capabilities: OutputCapabilities,
 ) -> agent_client_protocol::Result<()> {
     for item in content {
         match item {
@@ -1702,7 +1632,7 @@ fn send_filtered_text(
                 ))?;
             }
             FilteredContent::Rich(rich) => {
-                for chunk in output_capabilities.rich_chunks_with_meta(&rich, text_metadata) {
+                for chunk in rich.to_acp_chunks_with_meta(text_metadata) {
                     connection.send_notification(SessionNotification::new(
                         session_id.clone(),
                         SessionUpdate::AgentMessageChunk(chunk),
@@ -2659,12 +2589,12 @@ mod tests {
         ] {
             assert!(!standard_text.contains(private_syntax));
         }
-        assert!(!updates.iter().any(|update| matches!(
+        assert!(updates.iter().any(|update| matches!(
             update,
             SessionUpdate::AgentMessageChunk(chunk)
                 if matches!(chunk.content, ContentBlock::Image(_))
         )));
-        assert!(!updates.iter().any(|update| matches!(
+        assert!(updates.iter().any(|update| matches!(
             update,
             SessionUpdate::AgentMessageChunk(chunk)
                 if matches!(chunk.content, ContentBlock::ResourceLink(_))
@@ -2672,7 +2602,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_client_receives_only_markdown_rich_content_fallback() {
+    async fn rich_content_sends_markdown_fallback_before_svg_preview() {
         let updates = Arc::new(Mutex::new(Vec::new()));
         let received = Arc::clone(&updates);
         let client = agent_client_protocol::Client
@@ -2721,58 +2651,14 @@ mod tests {
             .meta
             .as_ref()
             .is_some_and(|meta| meta.contains_key(RICH_CONTENT_NAMESPACE)));
-        assert_eq!(updates.len(), 1);
+        let Some(SessionUpdate::AgentMessageChunk(image_chunk)) = updates.get(1) else {
+            panic!("expected image preview");
+        };
+        assert!(matches!(image_chunk.content, ContentBlock::Image(_)));
     }
 
     #[tokio::test]
-    async fn svg_capable_client_receives_only_svg_preview() {
-        let updates = Arc::new(Mutex::new(Vec::new()));
-        let received = Arc::clone(&updates);
-        let client = agent_client_protocol::Client
-            .builder()
-            .on_receive_notification(
-                async move |notification: SessionNotification, _cx| {
-                    received.lock().expect("mutex").push(notification.update);
-                    Ok(())
-                },
-                agent_client_protocol::on_receive_notification!(),
-            );
-
-        client
-            .connect_with(acp_agent(RichBackend), async |connection| {
-                let mut initialize = InitializeRequest::new(ProtocolVersion::V1);
-                initialize.meta = Some(serde_json::Map::from_iter([(
-                    CONTENT_CAPABILITIES_META_KEY.to_owned(),
-                    serde_json::json!({ CONTENT_TYPES_FIELD: [SVG_CONTENT_TYPE] }),
-                )]));
-                connection.send_request(initialize).block_task().await?;
-                let session = connection
-                    .send_request(NewSessionRequest::new(std::path::PathBuf::from("/tmp")))
-                    .block_task()
-                    .await?;
-                connection
-                    .send_request(PromptRequest::new(
-                        session.session_id,
-                        vec![ContentBlock::Text(TextContent::new("chart"))],
-                    ))
-                    .block_task()
-                    .await?;
-                Ok(())
-            })
-            .await
-            .expect("ACP exchange");
-
-        let updates = updates.lock().expect("mutex");
-        assert_eq!(updates.len(), 1);
-        assert!(matches!(
-            updates.first(),
-            Some(SessionUpdate::AgentMessageChunk(chunk))
-                if matches!(chunk.content, ContentBlock::Image(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn streamed_vis_chart_uses_markdown_for_unknown_client() {
+    async fn complete_streamed_vis_chart_fence_adds_one_svg_preview() {
         let updates = Arc::new(Mutex::new(Vec::new()));
         let received = Arc::clone(&updates);
         let client = agent_client_protocol::Client
@@ -2817,7 +2703,7 @@ mod tests {
                         if matches!(chunk.content, ContentBlock::Image(_))
                 ))
                 .count(),
-            0
+            1
         );
         let visible_text = updates
             .iter()
