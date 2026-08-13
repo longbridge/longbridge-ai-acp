@@ -28,6 +28,16 @@ struct SessionRecord<BackendSession> {
 
 type Sessions<BackendSession> = Arc<RwLock<HashMap<SessionId, SessionRecord<BackendSession>>>>;
 
+fn standard_rich_chunks(
+    rich: &RichContent,
+    extra: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Vec<ContentChunk> {
+    rich.to_acp_chunks_with_meta(extra)
+        .into_iter()
+        .take(1)
+        .collect()
+}
+
 fn flatten_prompt(blocks: &[ContentBlock]) -> agent_client_protocol::Result<String> {
     blocks
         .iter()
@@ -166,8 +176,7 @@ fn history_updates<Session>(
                     .meta(longbridge_meta(metadata)),
             )]
         }
-        AgentEvent::RichContent(rich) => rich
-            .to_acp_chunks()
+        AgentEvent::RichContent(rich) => standard_rich_chunks(&rich, None)
             .into_iter()
             .map(SessionUpdate::AgentMessageChunk)
             .collect(),
@@ -220,8 +229,7 @@ fn filtered_history_updates(content: Vec<FilteredContent>) -> Vec<SessionUpdate>
                     ContentBlock::Text(TextContent::new(text)),
                 ))]
             }
-            FilteredContent::Rich(rich) => rich
-                .to_acp_chunks()
+            FilteredContent::Rich(rich) => standard_rich_chunks(&rich, None)
                 .into_iter()
                 .map(SessionUpdate::AgentMessageChunk)
                 .collect(),
@@ -882,7 +890,7 @@ pub fn acp_agent<B: AgentBackend>(
                             }
                             AgentEvent::RichContent(content) => {
                                 tracing::debug!(target: "longbridge_ai_acp::protocol", session_id = %request.session_id.0, content_id = %content.content_id, kind = ?content.kind, update = "rich_content", "ACP rich content sent");
-                                for chunk in content.to_acp_chunks() {
+                                for chunk in standard_rich_chunks(&content, None) {
                                     task_connection.send_notification(SessionNotification::new(
                                         request.session_id.clone(),
                                         SessionUpdate::AgentMessageChunk(chunk),
@@ -1632,7 +1640,7 @@ fn send_filtered_text(
                 ))?;
             }
             FilteredContent::Rich(rich) => {
-                for chunk in rich.to_acp_chunks_with_meta(text_metadata) {
+                for chunk in standard_rich_chunks(&rich, text_metadata) {
                     connection.send_notification(SessionNotification::new(
                         session_id.clone(),
                         SessionUpdate::AgentMessageChunk(chunk),
@@ -2589,12 +2597,12 @@ mod tests {
         ] {
             assert!(!standard_text.contains(private_syntax));
         }
-        assert!(updates.iter().any(|update| matches!(
+        assert!(!updates.iter().any(|update| matches!(
             update,
             SessionUpdate::AgentMessageChunk(chunk)
                 if matches!(chunk.content, ContentBlock::Image(_))
         )));
-        assert!(updates.iter().any(|update| matches!(
+        assert!(!updates.iter().any(|update| matches!(
             update,
             SessionUpdate::AgentMessageChunk(chunk)
                 if matches!(chunk.content, ContentBlock::ResourceLink(_))
@@ -2602,7 +2610,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rich_content_sends_markdown_fallback_before_svg_preview() {
+    async fn rich_content_uses_one_portable_markdown_representation() {
         let updates = Arc::new(Mutex::new(Vec::new()));
         let received = Arc::clone(&updates);
         let client = agent_client_protocol::Client
@@ -2651,14 +2659,11 @@ mod tests {
             .meta
             .as_ref()
             .is_some_and(|meta| meta.contains_key(RICH_CONTENT_NAMESPACE)));
-        let Some(SessionUpdate::AgentMessageChunk(image_chunk)) = updates.get(1) else {
-            panic!("expected image preview");
-        };
-        assert!(matches!(image_chunk.content, ContentBlock::Image(_)));
+        assert_eq!(updates.len(), 1);
     }
 
     #[tokio::test]
-    async fn complete_streamed_vis_chart_fence_adds_one_svg_preview() {
+    async fn streamed_vis_chart_uses_one_portable_markdown_representation() {
         let updates = Arc::new(Mutex::new(Vec::new()));
         let received = Arc::clone(&updates);
         let client = agent_client_protocol::Client
@@ -2703,7 +2708,7 @@ mod tests {
                         if matches!(chunk.content, ContentBlock::Image(_))
                 ))
                 .count(),
-            1
+            0
         );
         let visible_text = updates
             .iter()
