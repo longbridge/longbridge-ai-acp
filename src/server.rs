@@ -2,11 +2,13 @@ use crate::{rich_content::chart_markdown_fallback, AgentBackend, AgentEvent, Ric
 use agent_client_protocol::schema::{
     v1::{
         AgentCapabilities, CancelNotification, ContentBlock, ContentChunk, Implementation,
-        InitializeRequest, InitializeResponse, NewSessionRequest, NewSessionResponse,
+        InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
+        LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse,
         PermissionOption, PermissionOptionKind, Plan as AcpPlan, PlanEntry, PlanEntryPriority,
         PlanEntryStatus, PromptRequest, PromptResponse, RequestPermissionOutcome,
-        RequestPermissionRequest, SessionId, SessionInfoUpdate, SessionNotification, SessionUpdate,
-        StopReason, TextContent, ToolCall, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+        RequestPermissionRequest, SessionCapabilities, SessionId, SessionInfo, SessionInfoUpdate,
+        SessionListCapabilities, SessionNotification, SessionUpdate, StopReason, TextContent,
+        ToolCall, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
     },
     ProtocolVersion,
 };
@@ -40,6 +42,223 @@ fn flatten_prompt(blocks: &[ContentBlock]) -> agent_client_protocol::Result<Stri
         .map(|parts| parts.join("\n"))
 }
 
+fn history_updates<Session>(
+    event: AgentEvent<Session>,
+    rich_text: &mut RichTextFilter,
+) -> Vec<SessionUpdate> {
+    match event {
+        AgentEvent::UserText(text) => vec![SessionUpdate::UserMessageChunk(ContentChunk::new(
+            ContentBlock::Text(TextContent::new(text)),
+        ))],
+        AgentEvent::Text(text) => filtered_history_updates(rich_text.push(&text)),
+        AgentEvent::Thought(text) => vec![SessionUpdate::AgentThoughtChunk(ContentChunk::new(
+            ContentBlock::Text(TextContent::new(text)),
+        ))],
+        AgentEvent::Content {
+            text,
+            thought,
+            metadata,
+        } => {
+            if thought {
+                vec![SessionUpdate::AgentThoughtChunk(ContentChunk::new(
+                    ContentBlock::Text(TextContent::new(text).meta(longbridge_meta(metadata))),
+                ))]
+            } else {
+                rich_text.update_stocks(&metadata);
+                rich_text.update_references(&metadata);
+                let mut updates = vec![SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                    ContentBlock::Text(TextContent::new("").meta(longbridge_meta(metadata))),
+                ))];
+                updates.extend(filtered_history_updates(rich_text.push(&text)));
+                updates
+            }
+        }
+        AgentEvent::ToolStarted {
+            id,
+            title,
+            raw_input,
+        } => vec![SessionUpdate::ToolCall(
+            ToolCall::new(id, title)
+                .status(ToolCallStatus::InProgress)
+                .raw_input(raw_input),
+        )],
+        AgentEvent::ToolFinished {
+            id,
+            title,
+            success,
+            raw_output,
+        } => vec![SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+            id,
+            ToolCallUpdateFields::new()
+                .title(title)
+                .status(if success {
+                    ToolCallStatus::Completed
+                } else {
+                    ToolCallStatus::Failed
+                })
+                .raw_output(raw_output),
+        ))],
+        AgentEvent::ToolStartedRich {
+            id,
+            title,
+            raw_input,
+            metadata,
+        } => vec![SessionUpdate::ToolCall(
+            ToolCall::new(id, title)
+                .status(ToolCallStatus::InProgress)
+                .raw_input(raw_input)
+                .meta(longbridge_meta(metadata)),
+        )],
+        AgentEvent::ToolFinishedRich {
+            id,
+            title,
+            success,
+            raw_output,
+            metadata,
+        } => vec![SessionUpdate::ToolCallUpdate(
+            ToolCallUpdate::new(
+                id,
+                ToolCallUpdateFields::new()
+                    .title(title)
+                    .status(if success {
+                        ToolCallStatus::Completed
+                    } else {
+                        ToolCallStatus::Failed
+                    })
+                    .raw_output(raw_output),
+            )
+            .meta(longbridge_meta(metadata)),
+        )],
+        AgentEvent::ToolProgressRich {
+            id,
+            title,
+            raw_output,
+            metadata,
+        } => vec![SessionUpdate::ToolCallUpdate(
+            ToolCallUpdate::new(
+                id,
+                ToolCallUpdateFields::new()
+                    .title(title)
+                    .status(ToolCallStatus::InProgress)
+                    .raw_output(raw_output),
+            )
+            .meta(longbridge_meta(metadata)),
+        )],
+        AgentEvent::Plan { entries, metadata } => vec![SessionUpdate::Plan(
+            AcpPlan::new(
+                entries
+                    .into_iter()
+                    .map(|entry| {
+                        PlanEntry::new(
+                            entry.content,
+                            plan_priority(&entry.priority),
+                            plan_status(&entry.status),
+                        )
+                    })
+                    .collect(),
+            )
+            .meta(longbridge_meta(metadata)),
+        )],
+        AgentEvent::SessionTitle { title, metadata } => {
+            vec![SessionUpdate::SessionInfoUpdate(
+                SessionInfoUpdate::new()
+                    .title(title)
+                    .meta(longbridge_meta(metadata)),
+            )]
+        }
+        AgentEvent::RichContent(rich) => rich
+            .to_acp_chunks()
+            .into_iter()
+            .map(SessionUpdate::AgentMessageChunk)
+            .collect(),
+        AgentEvent::Extension {
+            namespace,
+            event,
+            data,
+        } => vec![SessionUpdate::AgentMessageChunk(ContentChunk::new(
+            ContentBlock::Text(TextContent::new("").meta(extension_meta(namespace, event, data))),
+        ))],
+        AgentEvent::NeedsInput {
+            questions,
+            metadata,
+            ..
+        } => vec![SessionUpdate::AgentMessageChunk(ContentChunk::new(
+            ContentBlock::Text(
+                TextContent::new(questions.join("\n"))
+                    .meta(metadata.map(longbridge_meta).unwrap_or_default()),
+            ),
+        ))],
+        AgentEvent::PermissionRequired {
+            title, metadata, ..
+        }
+        | AgentEvent::Notice {
+            text: title,
+            metadata,
+            ..
+        } => vec![SessionUpdate::AgentMessageChunk(ContentChunk::new(
+            ContentBlock::Text(
+                TextContent::new(title).meta(metadata.map(longbridge_meta).unwrap_or_default()),
+            ),
+        ))],
+        AgentEvent::Completed { metadata, .. } => completion_markdown(&metadata)
+            .map(|text| {
+                vec![SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                    ContentBlock::Text(TextContent::new(text)),
+                ))]
+            })
+            .unwrap_or_default(),
+        AgentEvent::Finished(_) => Vec::new(),
+    }
+}
+
+fn filtered_history_updates(content: Vec<FilteredContent>) -> Vec<SessionUpdate> {
+    content
+        .into_iter()
+        .flat_map(|item| match item {
+            FilteredContent::Text(text) if !text.is_empty() => {
+                vec![SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                    ContentBlock::Text(TextContent::new(text)),
+                ))]
+            }
+            FilteredContent::Rich(rich) => rich
+                .to_acp_chunks()
+                .into_iter()
+                .map(SessionUpdate::AgentMessageChunk)
+                .collect(),
+            FilteredContent::Text(_) => Vec::new(),
+        })
+        .collect()
+}
+
+fn plan_priority(priority: &str) -> PlanEntryPriority {
+    match priority {
+        "high" => PlanEntryPriority::High,
+        "low" => PlanEntryPriority::Low,
+        _ => PlanEntryPriority::Medium,
+    }
+}
+
+fn plan_status(status: &str) -> PlanEntryStatus {
+    match status {
+        "in_progress" | "running" => PlanEntryStatus::InProgress,
+        "completed" | "succeeded" | "done" => PlanEntryStatus::Completed,
+        _ => PlanEntryStatus::Pending,
+    }
+}
+
+fn extension_meta(
+    namespace: String,
+    event: String,
+    data: serde_json::Value,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut meta = serde_json::Map::new();
+    meta.insert(
+        namespace,
+        serde_json::json!({ "event": event, "data": data }),
+    );
+    meta
+}
+
 /// Build an ACP agent component around any backend.
 pub fn acp_agent<B: AgentBackend>(
     backend: B,
@@ -48,8 +267,11 @@ pub fn acp_agent<B: AgentBackend>(
     let sessions: Sessions<B::Session> = Arc::new(RwLock::new(HashMap::new()));
 
     let new_sessions = Arc::clone(&sessions);
+    let load_sessions = Arc::clone(&sessions);
     let prompt_sessions = Arc::clone(&sessions);
     let cancel_sessions = Arc::clone(&sessions);
+    let list_backend = Arc::clone(&backend);
+    let load_backend = Arc::clone(&backend);
     Agent
         .builder()
         .name("longbridge-ai")
@@ -71,9 +293,18 @@ pub fn acp_agent<B: AgentBackend>(
                             .data("only ACP protocol version 1 is supported"),
                     );
                 }
+                let capabilities = if B::SESSION_HISTORY {
+                    AgentCapabilities::new()
+                        .load_session(true)
+                        .session_capabilities(
+                            SessionCapabilities::new().list(SessionListCapabilities::new()),
+                        )
+                } else {
+                    AgentCapabilities::new()
+                };
                 responder.respond(
                     InitializeResponse::new(ProtocolVersion::V1)
-                        .agent_capabilities(AgentCapabilities::new())
+                        .agent_capabilities(capabilities)
                         .agent_info(Implementation::new(
                             "Longbridge AI",
                             env!("CARGO_PKG_VERSION"),
@@ -102,6 +333,101 @@ pub fn acp_agent<B: AgentBackend>(
                     },
                 );
                 responder.respond(NewSessionResponse::new(id))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: ListSessionsRequest,
+                        responder: Responder<ListSessionsResponse>,
+                        _connection| {
+                if !B::SESSION_HISTORY {
+                    return responder.respond_with_error(
+                        agent_client_protocol::Error::method_not_found(),
+                    );
+                }
+                match list_backend
+                    .list_sessions(request.cwd.as_deref(), request.cursor.as_deref())
+                    .await
+                {
+                    Ok(page) => {
+                        let sessions = page
+                            .sessions
+                            .into_iter()
+                            .map(|session| {
+                                SessionInfo::new(session.session_id, session.cwd)
+                                    .title(session.title)
+                                    .updated_at(session.updated_at)
+                            })
+                            .collect();
+                        responder.respond(
+                            ListSessionsResponse::new(sessions).next_cursor(page.next_cursor),
+                        )
+                    }
+                    Err(error) => responder.respond_with_error(
+                        agent_client_protocol::Error::internal_error().data(error.to_string()),
+                    ),
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: LoadSessionRequest,
+                        responder: Responder<LoadSessionResponse>,
+                        connection: ConnectionTo<Client>| {
+                if !B::SESSION_HISTORY {
+                    return responder.respond_with_error(
+                        agent_client_protocol::Error::method_not_found(),
+                    );
+                }
+                let loaded = match load_backend
+                    .load_session(request.session_id.0.as_ref(), &request.cwd)
+                    .await
+                {
+                    Ok(loaded) => loaded,
+                    Err(error) => {
+                        return responder.respond_with_error(
+                            agent_client_protocol::Error::internal_error().data(error.to_string()),
+                        );
+                    }
+                };
+                let mut history = loaded.history;
+                let mut rich_text = RichTextFilter::new(request.session_id.0.as_ref());
+                while let Some(event) = history.next().await {
+                    let event = match event {
+                        Ok(event) => event,
+                        Err(error) => {
+                            return responder.respond_with_error(
+                                agent_client_protocol::Error::internal_error()
+                                    .data(error.to_string()),
+                            );
+                        }
+                    };
+                    for update in history_updates(event, &mut rich_text) {
+                        if let Err(error) = connection.send_notification(SessionNotification::new(
+                            request.session_id.clone(),
+                            update,
+                        )) {
+                            return responder.respond_with_error(error);
+                        }
+                    }
+                }
+                for update in filtered_history_updates(rich_text.finish()) {
+                    if let Err(error) = connection.send_notification(SessionNotification::new(
+                        request.session_id.clone(),
+                        update,
+                    )) {
+                        return responder.respond_with_error(error);
+                    }
+                }
+                load_sessions.write().await.insert(
+                    request.session_id.clone(),
+                    SessionRecord {
+                        cwd: request.cwd,
+                        state: loaded.state,
+                        cancel: tokio::sync::watch::channel(0).0,
+                    },
+                );
+                responder.respond(LoadSessionResponse::new())
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -215,6 +541,14 @@ pub fn acp_agent<B: AgentBackend>(
                             );
                             agent_client_protocol::Error::internal_error().data(error.to_string())
                         })? {
+                            AgentEvent::UserText(text) => {
+                                task_connection.send_notification(SessionNotification::new(
+                                    request.session_id.clone(),
+                                    SessionUpdate::UserMessageChunk(ContentChunk::new(
+                                        ContentBlock::Text(TextContent::new(text)),
+                                    )),
+                                ))?;
+                            }
                             AgentEvent::Text(text) => {
                                 tracing::debug!(target: "longbridge_ai_acp::protocol", session_id = %request.session_id.0, chars = text.chars().count(), update = "agent_message_chunk", "ACP session update sent");
                                 send_filtered_text(
@@ -1378,6 +1712,8 @@ mod tests {
 
     struct CompatibilityBackend;
 
+    struct HistoryBackend;
+
     #[test]
     fn failed_tool_message_prefers_structured_error_detail() {
         assert_eq!(
@@ -1776,6 +2112,62 @@ mod tests {
     }
 
     #[async_trait]
+    impl AgentBackend for HistoryBackend {
+        type Session = TestSession;
+
+        const SESSION_HISTORY: bool = true;
+
+        async fn list_sessions(
+            &self,
+            _cwd: Option<&Path>,
+            cursor: Option<&str>,
+        ) -> Result<crate::AgentSessionPage, BackendError> {
+            assert_eq!(cursor, Some("page-1"));
+            Ok(crate::AgentSessionPage {
+                sessions: vec![crate::AgentSessionInfo {
+                    session_id: "chat-1".into(),
+                    cwd: "/workspace".into(),
+                    title: Some("Market review".into()),
+                    updated_at: Some("2026-08-13T08:00:00Z".into()),
+                }],
+                next_cursor: Some("page-2".into()),
+            })
+        }
+
+        async fn load_session(
+            &self,
+            session_id: &str,
+            cwd: &Path,
+        ) -> Result<crate::LoadedAgentSession<Self::Session>, BackendError> {
+            assert_eq!(session_id, "chat-1");
+            assert_eq!(cwd, Path::new("/workspace"));
+            Ok(crate::LoadedAgentSession {
+                state: TestSession {
+                    conversation_id: Some("chat-1".into()),
+                },
+                history: Box::pin(stream::iter([
+                    Ok(AgentEvent::UserText("Compare NVDA and TSLA".into())),
+                    Ok(AgentEvent::Thought("Checking prices".into())),
+                    Ok(AgentEvent::Text("NVDA outperformed.".into())),
+                ])),
+            })
+        }
+
+        async fn prompt(
+            &self,
+            session: TestSession,
+            prompt: String,
+            _cwd: &Path,
+        ) -> Result<BoxStream<'static, Result<AgentEvent<TestSession>, BackendError>>, BackendError>
+        {
+            assert_eq!(session.conversation_id.as_deref(), Some("chat-1"));
+            Ok(Box::pin(stream::iter([Ok(AgentEvent::Text(format!(
+                "continued: {prompt}"
+            )))])))
+        }
+    }
+
+    #[async_trait]
     impl AgentBackend for RichBackend {
         type Session = ();
 
@@ -1974,6 +2366,76 @@ mod tests {
         ));
         assert!(matches!(
             updates.get(1),
+            Some(SessionUpdate::AgentMessageChunk(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn lists_and_loads_persistent_sessions() {
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let received = Arc::clone(&updates);
+        let client = agent_client_protocol::Client
+            .builder()
+            .on_receive_notification(
+                async move |notification: SessionNotification, _cx| {
+                    received.lock().expect("mutex").push(notification.update);
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_notification!(),
+            );
+
+        let (initialize, listed) = client
+            .connect_with(acp_agent(HistoryBackend), async |connection| {
+                let initialize = connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let listed = connection
+                    .send_request(ListSessionsRequest::new().cursor("page-1"))
+                    .block_task()
+                    .await?;
+                connection
+                    .send_request(LoadSessionRequest::new("chat-1", "/workspace"))
+                    .block_task()
+                    .await?;
+                connection
+                    .send_request(PromptRequest::new(
+                        "chat-1",
+                        vec![ContentBlock::Text(TextContent::new("What next?"))],
+                    ))
+                    .block_task()
+                    .await?;
+                Ok((initialize, listed))
+            })
+            .await
+            .expect("ACP history exchange");
+
+        assert!(initialize.agent_capabilities.load_session);
+        assert!(initialize
+            .agent_capabilities
+            .session_capabilities
+            .list
+            .is_some());
+        assert_eq!(listed.sessions.len(), 1);
+        assert_eq!(listed.sessions[0].session_id.0.as_ref(), "chat-1");
+        assert_eq!(listed.sessions[0].title.as_deref(), Some("Market review"));
+        assert_eq!(listed.next_cursor.as_deref(), Some("page-2"));
+
+        let updates = updates.lock().expect("mutex");
+        assert!(matches!(
+            updates.first(),
+            Some(SessionUpdate::UserMessageChunk(_))
+        ));
+        assert!(matches!(
+            updates.get(1),
+            Some(SessionUpdate::AgentThoughtChunk(_))
+        ));
+        assert!(matches!(
+            updates.get(2),
+            Some(SessionUpdate::AgentMessageChunk(_))
+        ));
+        assert!(matches!(
+            updates.get(3),
             Some(SessionUpdate::AgentMessageChunk(_))
         ));
     }
