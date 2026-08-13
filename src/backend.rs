@@ -1,10 +1,11 @@
 use async_trait::async_trait;
 use futures::stream::BoxStream;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 pub type BackendError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AgentPlanEntry {
     pub content: String,
     pub priority: String,
@@ -31,7 +32,7 @@ pub struct LoadedAgentSession<Session> {
 }
 
 /// Events understood by the protocol adapter.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum AgentEvent<Session> {
     /// Historical user content emitted while loading a session.
     UserText(String),
