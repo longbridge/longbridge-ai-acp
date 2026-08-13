@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use futures::stream::BoxStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub type BackendError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -11,9 +11,30 @@ pub struct AgentPlanEntry {
     pub status: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentSessionInfo {
+    pub session_id: String,
+    pub cwd: PathBuf,
+    pub title: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentSessionPage {
+    pub sessions: Vec<AgentSessionInfo>,
+    pub next_cursor: Option<String>,
+}
+
+pub struct LoadedAgentSession<Session> {
+    pub state: Session,
+    pub history: BoxStream<'static, Result<AgentEvent<Session>, BackendError>>,
+}
+
 /// Events understood by the protocol adapter.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AgentEvent<Session> {
+    /// Historical user content emitted while loading a session.
+    UserText(String),
     Text(String),
     Thought(String),
     /// A text or reasoning delta with provider metadata attached losslessly.
@@ -109,6 +130,25 @@ pub enum AgentEvent<Session> {
 #[async_trait]
 pub trait AgentBackend: Send + Sync + 'static {
     type Session: Clone + Default + Send + Sync + 'static;
+
+    /// Whether this backend implements ACP `session/list` and `session/load`.
+    const SESSION_HISTORY: bool = false;
+
+    async fn list_sessions(
+        &self,
+        _cwd: Option<&Path>,
+        _cursor: Option<&str>,
+    ) -> Result<AgentSessionPage, BackendError> {
+        Err("session history is not supported".into())
+    }
+
+    async fn load_session(
+        &self,
+        _session_id: &str,
+        _cwd: &Path,
+    ) -> Result<LoadedAgentSession<Self::Session>, BackendError> {
+        Err("session history is not supported".into())
+    }
 
     async fn prompt(
         &self,
