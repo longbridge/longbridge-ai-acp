@@ -1744,6 +1744,22 @@ mod tests {
         assert_eq!(text, "[docs](https://example.com) and [not\na citation]");
     }
 
+    #[test]
+    fn standard_markdown_tables_and_math_pass_through_unchanged() {
+        let source = "| Symbol | Price |\n| --- | ---: |\n| TSLA.US | 300 |\n\n$$E = mc^2$$";
+        let mut filter = RichTextFilter::new("session-1");
+        let mut output = filter.push(source);
+        output.extend(filter.finish());
+        let text = output
+            .iter()
+            .filter_map(|item| match item {
+                FilteredContent::Text(text) => Some(text.as_str()),
+                FilteredContent::Rich(_) => None,
+            })
+            .collect::<String>();
+        assert_eq!(text, source);
+    }
+
     #[async_trait]
     impl AgentBackend for SlowBackend {
         type Session = ();
