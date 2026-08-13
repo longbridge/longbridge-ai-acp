@@ -858,16 +858,7 @@ impl RichTextFilter {
                 }
                 continue;
             }
-            let after_marker = marker.len();
-            let Some(body_start) = self.buffer[after_marker..]
-                .strip_prefix("\r\n")
-                .map(|_| after_marker + 2)
-                .or_else(|| {
-                    self.buffer[after_marker..]
-                        .strip_prefix('\n')
-                        .map(|_| after_marker + 1)
-                })
-            else {
+            let Some(body_start) = fenced_body_start(&self.buffer, marker.len()) else {
                 break;
             };
             let Some(relative_close) = self.buffer[body_start..].find("```") else {
@@ -928,7 +919,9 @@ impl RichTextFilter {
                     self.next_chart += 1;
                     output.push(FilteredContent::Rich(chart));
                 }
-                None => output.push(FilteredContent::Text(complete)),
+                None => output.push(FilteredContent::Text(
+                    "Chart content was omitted because its data was invalid.".to_owned(),
+                )),
             }
         }
         output
@@ -941,6 +934,21 @@ impl RichTextFilter {
             vec![FilteredContent::Text(std::mem::take(&mut self.buffer))]
         }
     }
+}
+
+fn fenced_body_start(value: &str, marker_end: usize) -> Option<usize> {
+    let suffix = value.get(marker_end..)?;
+    if suffix.starts_with("\r\n") {
+        return Some(marker_end + 2);
+    }
+    if suffix.starts_with('\n') {
+        return Some(marker_end + 1);
+    }
+    if !suffix.starts_with([' ', '\t']) {
+        return None;
+    }
+    let newline = suffix.find('\n')?;
+    Some(marker_end + newline + 1)
 }
 
 fn find_html_tag_end(value: &str) -> Option<usize> {
@@ -1137,6 +1145,12 @@ fn render_citation(
     match references.get(&index) {
         Some(Some(url)) => format!("[\\[{index}\\]]({})", escape_link_url(url)),
         Some(None) => format!("\\[{index}\\]"),
+        None if original
+            .get(1..)
+            .is_some_and(|value| value.trim_start().starts_with("citation")) =>
+        {
+            format!("\\[{index}\\]")
+        }
         None => original.to_owned(),
     }
 }
@@ -1341,6 +1355,8 @@ mod tests {
 
     struct StructuredEventsBackend;
 
+    struct CompatibilityBackend;
+
     #[test]
     fn failed_tool_message_prefers_structured_error_detail() {
         assert_eq!(
@@ -1387,6 +1403,18 @@ mod tests {
         assert_eq!(html.kind, crate::RichContentKind::Html);
         assert!(html.fallback.contains("Profit dashboard"));
         assert!(!html.fallback.contains("<h1>"));
+    }
+
+    #[test]
+    fn custom_fence_attributes_do_not_leak_source_markup() {
+        let mut filter = RichTextFilter::new("session-1");
+        let output =
+            filter.push("```html-live variant=longimage\n<section><h1>Report</h1></section>\n```");
+        let FilteredContent::Rich(html) = &output[0] else {
+            panic!("expected rich HTML content");
+        };
+        assert!(html.fallback.contains("Report"));
+        assert!(!html.fallback.contains("<section>"));
     }
 
     #[test]
@@ -1588,12 +1616,23 @@ mod tests {
     }
 
     #[test]
-    fn unknown_citation_is_preserved() {
+    fn unresolved_explicit_citation_becomes_a_standard_number() {
         let mut filter = RichTextFilter::new("session-1");
         let output = filter.push("[citation 9]");
         assert!(matches!(
             output.first(),
-            Some(FilteredContent::Text(text)) if text == "[citation 9]"
+            Some(FilteredContent::Text(text)) if text == "\\[9\\]"
+        ));
+    }
+
+    #[test]
+    fn malformed_chart_is_omitted_instead_of_echoing_custom_syntax() {
+        let mut filter = RichTextFilter::new("session-1");
+        let output = filter.push("```vis-chart\n{not json}\n```");
+        assert!(matches!(
+            output.first(),
+            Some(FilteredContent::Text(text))
+                if text == "Chart content was omitted because its data was invalid."
         ));
     }
 
@@ -1800,6 +1839,48 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl AgentBackend for CompatibilityBackend {
+        type Session = ();
+
+        async fn prompt(
+            &self,
+            _session: (),
+            _prompt: String,
+            _cwd: &Path,
+        ) -> Result<BoxStream<'static, Result<AgentEvent<()>, BackendError>>, BackendError>
+        {
+            let text = concat!(
+                "[stock Tesla] [citation 1]\n",
+                "```vis-chart\n",
+                "{\"type\":\"column\",\"data\":[{\"category\":\"FY2025\",\"value\":3}]}\n",
+                "```\n",
+                "```html-live\n<h1>Dashboard</h1><script>run()</script>\n```\n",
+                "```svg-inline\n<svg xmlns=\"http://www.w3.org/2000/svg\"><circle r=\"3\"/></svg>\n```\n",
+                "<x-widget src=\"widget://quote/security/detail?symbol=AAPL.US\" />"
+            );
+            Ok(Box::pin(stream::iter([Ok(AgentEvent::Content {
+                text: text.into(),
+                thought: false,
+                metadata: serde_json::json!({
+                    "event": "message",
+                    "data": {
+                        "type": "answer",
+                        "text": text,
+                        "outputs": {
+                            "stocks": [{ "id": "Tesla", "counter_ids": ["ST/US/TSLA"] }],
+                            "references": [{
+                                "index": 1,
+                                "type": "WebSearch",
+                                "content": { "url": "https://example.com/source" }
+                            }]
+                        }
+                    }
+                }),
+            })])))
+        }
+    }
+
     #[tokio::test]
     async fn exposes_streaming_acp_session() {
         let updates = Arc::new(Mutex::new(Vec::new()));
@@ -1909,6 +1990,102 @@ mod tests {
             info.meta.as_ref().unwrap()["longbridge.ai/event"]["event"],
             "chat_title_updated"
         );
+    }
+
+    #[tokio::test]
+    async fn compatibility_golden_keeps_native_event_and_normalizes_generic_content() {
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let received = Arc::clone(&updates);
+        let client = agent_client_protocol::Client
+            .builder()
+            .on_receive_notification(
+                async move |notification: SessionNotification, _cx| {
+                    received.lock().expect("mutex").push(notification.update);
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_notification!(),
+            );
+        client
+            .connect_with(acp_agent(CompatibilityBackend), async |connection| {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let session = connection
+                    .send_request(NewSessionRequest::new(std::path::PathBuf::from("/tmp")))
+                    .block_task()
+                    .await?;
+                connection
+                    .send_request(PromptRequest::new(
+                        session.session_id,
+                        vec![ContentBlock::Text(TextContent::new("render"))],
+                    ))
+                    .block_task()
+                    .await?;
+                Ok(())
+            })
+            .await
+            .expect("ACP exchange");
+
+        let updates = updates.lock().expect("mutex");
+        let native = updates.iter().find_map(|update| match update {
+            SessionUpdate::AgentMessageChunk(chunk) => match &chunk.content {
+                ContentBlock::Text(text) => text
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| meta.get("longbridge.ai/event")),
+                _ => None,
+            },
+            _ => None,
+        });
+        let native_text = native
+            .and_then(|event| event.pointer("/data/text"))
+            .and_then(serde_json::Value::as_str)
+            .expect("native source text");
+        assert!(native_text.contains("```vis-chart"));
+        assert!(native_text.contains("<x-widget"));
+
+        let standard_text = updates
+            .iter()
+            .filter_map(|update| match update {
+                SessionUpdate::AgentMessageChunk(chunk) => match &chunk.content {
+                    ContentBlock::Text(text)
+                        if text.meta.as_ref().is_some_and(|meta| {
+                            meta.get("longbridge.ai/standard-fallback")
+                                == Some(&serde_json::Value::Bool(true))
+                        }) =>
+                    {
+                        Some(text.text.as_str())
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect::<String>();
+        assert!(standard_text.contains("[TSLA.US](https://longbridge.com/quote/tsla.us)"));
+        assert!(standard_text.contains("https://example.com/source"));
+        assert!(standard_text.contains("| category | value |"));
+        assert!(standard_text.contains("Dashboard"));
+        assert!(standard_text.contains("[AAPL.US](https://longbridge.com/quote/aapl.us)"));
+        for private_syntax in [
+            "[stock ",
+            "[citation ",
+            "```vis-chart",
+            "<x-widget",
+            "<script",
+        ] {
+            assert!(!standard_text.contains(private_syntax));
+        }
+        assert!(updates.iter().any(|update| matches!(
+            update,
+            SessionUpdate::AgentMessageChunk(chunk)
+                if matches!(chunk.content, ContentBlock::Image(_))
+        )));
+        assert!(updates.iter().any(|update| matches!(
+            update,
+            SessionUpdate::AgentMessageChunk(chunk)
+                if matches!(chunk.content, ContentBlock::ResourceLink(_))
+        )));
     }
 
     #[tokio::test]
