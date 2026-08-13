@@ -603,6 +603,17 @@ pub fn acp_agent<B: AgentBackend>(
                                         ContentBlock::Text(TextContent::new("").meta(meta)),
                                     )),
                                 ))?;
+                                if let Some(fallback) = completion_markdown(&metadata) {
+                                    task_connection.send_notification(SessionNotification::new(
+                                        request.session_id.clone(),
+                                        SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                            ContentBlock::Text(
+                                                TextContent::new(fallback)
+                                                    .meta(standard_fallback_meta()),
+                                            ),
+                                        )),
+                                    ))?;
+                                }
                             }
                         }
                     }
@@ -1117,6 +1128,66 @@ fn render_citation(
     }
 }
 
+fn completion_markdown(metadata: &serde_json::Value) -> Option<String> {
+    let outputs = metadata.get("outputs").unwrap_or(metadata);
+    let mut sections = Vec::new();
+    if let Some(references) = outputs
+        .get("references")
+        .and_then(serde_json::Value::as_array)
+    {
+        let sources = references
+            .iter()
+            .filter_map(|reference| {
+                let url = reference_url(reference)?;
+                let label = reference
+                    .pointer("/content/title")
+                    .or_else(|| reference.pointer("/content/name"))
+                    .or_else(|| reference.get("title"))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|label| !label.is_empty())
+                    .unwrap_or(&url);
+                Some(format!(
+                    "- [{}]({})",
+                    escape_link_label(label),
+                    escape_link_url(&url)
+                ))
+            })
+            .collect::<Vec<_>>();
+        if !sources.is_empty() {
+            sections.push(format!("### Sources\n\n{}", sources.join("\n")));
+        }
+    }
+    if let Some(questions) = outputs
+        .get("further_questions")
+        .and_then(serde_json::Value::as_array)
+    {
+        let questions = questions
+            .iter()
+            .filter_map(|question| {
+                question
+                    .as_str()
+                    .or_else(|| question.get("question").and_then(serde_json::Value::as_str))
+            })
+            .filter(|question| !question.is_empty())
+            .map(|question| format!("- {question}"))
+            .collect::<Vec<_>>();
+        if !questions.is_empty() {
+            sections.push(format!(
+                "### Suggested follow-ups\n\n{}",
+                questions.join("\n")
+            ));
+        }
+    }
+    (!sections.is_empty()).then(|| format!("\n\n{}", sections.join("\n\n")))
+}
+
+fn escape_link_label(label: &str) -> String {
+    label
+        .replace('\\', "\\\\")
+        .replace('[', "\\[")
+        .replace(']', "\\]")
+}
+
 fn html_text_fallback(html: &str) -> String {
     let mut text = String::new();
     let mut in_tag = false;
@@ -1505,6 +1576,40 @@ mod tests {
             text,
             "A[\\[1\\]](https://one.example) B[\\[2\\]](https://two.example)"
         );
+    }
+
+    #[test]
+    fn completion_fallback_exposes_sources_and_follow_up_questions() {
+        let markdown = completion_markdown(&serde_json::json!({
+            "outputs": {
+                "references": [{
+                    "type": "WebSearch",
+                    "content": {
+                        "title": "Example [source]",
+                        "url": "https://example.com/a path"
+                    }
+                }],
+                "further_questions": [
+                    "Compare valuation",
+                    { "question": "Review the earnings call" }
+                ]
+            }
+        }))
+        .expect("completion fallback");
+        assert!(markdown.contains("[Example \\[source\\]](https://example.com/a%20path)"));
+        assert!(markdown.contains("- Compare valuation"));
+        assert!(markdown.contains("- Review the earnings call"));
+    }
+
+    #[test]
+    fn completion_fallback_omits_private_financial_references() {
+        assert!(completion_markdown(&serde_json::json!({
+            "outputs": {
+                "references": [{ "type": "SecurityQuote", "id": "TSLA.US" }],
+                "further_questions": []
+            }
+        }))
+        .is_none());
     }
 
     #[test]
