@@ -28,4 +28,6 @@ pub use rich_content::{
     RichContentError, RichContentKind, Table, CHART_MIME_TYPE, RICH_CONTENT_NAMESPACE,
     RICH_CONTENT_VERSION, TABLE_MIME_TYPE,
 };
-pub use server::{acp_agent, serve_stdio};
+pub use server::{
+    acp_agent, acp_agent_with_auth_methods, serve_stdio, serve_stdio_with_auth_methods,
+};

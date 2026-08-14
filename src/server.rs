@@ -1,14 +1,15 @@
 use crate::{rich_content::chart_markdown_fallback, AgentBackend, AgentEvent, RichContent};
 use agent_client_protocol::schema::{
     v1::{
-        AgentCapabilities, CancelNotification, ContentBlock, ContentChunk, Implementation,
-        InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
-        LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse,
-        PermissionOption, PermissionOptionKind, Plan as AcpPlan, PlanEntry, PlanEntryPriority,
-        PlanEntryStatus, PromptRequest, PromptResponse, RequestPermissionOutcome,
-        RequestPermissionRequest, SessionCapabilities, SessionId, SessionInfo, SessionInfoUpdate,
-        SessionListCapabilities, SessionNotification, SessionUpdate, StopReason, TextContent,
-        ToolCall, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+        AgentCapabilities, AuthMethod, CancelNotification, ContentBlock, ContentChunk,
+        Implementation, InitializeRequest, InitializeResponse, ListSessionsRequest,
+        ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
+        NewSessionResponse, PermissionOption, PermissionOptionKind, Plan as AcpPlan, PlanEntry,
+        PlanEntryPriority, PlanEntryStatus, PromptRequest, PromptResponse,
+        RequestPermissionOutcome, RequestPermissionRequest, SessionCapabilities, SessionId,
+        SessionInfo, SessionInfoUpdate, SessionListCapabilities, SessionNotification,
+        SessionUpdate, StopReason, TextContent, ToolCall, ToolCallStatus, ToolCallUpdate,
+        ToolCallUpdateFields,
     },
     ProtocolVersion,
 };
@@ -271,6 +272,14 @@ fn extension_meta(
 pub fn acp_agent<B: AgentBackend>(
     backend: B,
 ) -> impl agent_client_protocol::component::ConnectTo<Client> {
+    acp_agent_with_auth_methods(backend, Vec::new())
+}
+
+/// Builds an ACP agent that advertises the supplied authentication methods.
+pub fn acp_agent_with_auth_methods<B: AgentBackend>(
+    backend: B,
+    auth_methods: Vec<AuthMethod>,
+) -> impl agent_client_protocol::component::ConnectTo<Client> {
     let backend = Arc::new(backend);
     let sessions: Sessions<B::Session> = Arc::new(RwLock::new(HashMap::new()));
 
@@ -314,6 +323,7 @@ pub fn acp_agent<B: AgentBackend>(
                 responder.respond(
                     InitializeResponse::new(ProtocolVersion::V1)
                         .agent_capabilities(capabilities)
+                        .auth_methods(auth_methods.clone())
                         .agent_info(Implementation::new(
                             "Longbridge AI",
                             env!("CARGO_PKG_VERSION"),
@@ -1680,9 +1690,19 @@ fn longbridge_meta(data: serde_json::Value) -> serde_json::Map<String, serde_jso
 
 /// Serve a backend over newline-delimited ACP JSON-RPC on stdin/stdout.
 pub async fn serve_stdio<B: AgentBackend>(backend: B) -> agent_client_protocol::Result<()> {
+    serve_stdio_with_auth_methods(backend, Vec::new()).await
+}
+
+/// Serve a backend over stdio and advertise authentication methods during initialization.
+pub async fn serve_stdio_with_auth_methods<B: AgentBackend>(
+    backend: B,
+    auth_methods: Vec<AuthMethod>,
+) -> agent_client_protocol::Result<()> {
     use agent_client_protocol::component::ConnectTo;
     tracing::info!(target: "longbridge_ai_acp::protocol", "ACP stdio server started");
-    let result = acp_agent(backend).connect_to(Stdio::new()).await;
+    let result = acp_agent_with_auth_methods(backend, auth_methods)
+        .connect_to(Stdio::new())
+        .await;
     match &result {
         Ok(()) => tracing::info!(target: "longbridge_ai_acp::protocol", "ACP stdio server stopped"),
         Err(error) => {
@@ -1696,6 +1716,7 @@ pub async fn serve_stdio<B: AgentBackend>(backend: B) -> agent_client_protocol::
 mod tests {
     use super::*;
     use crate::{AgentEvent, BackendError, RichContent, RICH_CONTENT_NAMESPACE};
+    use agent_client_protocol::schema::v1::{AuthMethod, AuthMethodTerminal};
     use agent_client_protocol::schema::v1::{ImageContent, ResourceLink};
     use async_trait::async_trait;
     use futures::{stream, stream::BoxStream};
@@ -2330,6 +2351,36 @@ mod tests {
                 }),
             })])))
         }
+    }
+
+    #[tokio::test]
+    async fn initialize_advertises_configured_terminal_auth() {
+        let response = agent_client_protocol::Client
+            .builder()
+            .connect_with(
+                acp_agent_with_auth_methods(
+                    MockBackend::default(),
+                    vec![AuthMethod::Terminal(
+                        AuthMethodTerminal::new("longbridge-login", "Log in to Longbridge")
+                            .args(vec!["auth".into(), "login".into()]),
+                    )],
+                ),
+                async |connection| {
+                    connection
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await
+                },
+            )
+            .await
+            .expect("ACP initialize");
+
+        assert_eq!(response.auth_methods.len(), 1);
+        let AuthMethod::Terminal(method) = &response.auth_methods[0] else {
+            panic!("expected terminal authentication");
+        };
+        assert_eq!(method.id.0.as_ref(), "longbridge-login");
+        assert_eq!(method.args, ["auth", "login"]);
     }
 
     #[tokio::test]
