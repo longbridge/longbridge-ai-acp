@@ -492,6 +492,7 @@ pub fn acp_agent_with_auth_methods<B: AgentBackend>(
                 let backend = Arc::clone(&backend);
                 let task_connection = connection.clone();
                 connection.spawn(async move {
+                    let result: agent_client_protocol::Result<PromptResponse> = async {
                     let (cwd, state, mut cancelled) = {
                         let sessions = prompt_sessions.read().await;
                         let record = sessions
@@ -982,7 +983,21 @@ pub fn acp_agent_with_auth_methods<B: AgentBackend>(
                         stop_reason = ?stop_reason,
                         "ACP prompt response sent"
                     );
-                    responder.respond(PromptResponse::new(stop_reason))
+                    Ok(PromptResponse::new(stop_reason))
+                    }
+                    .await;
+                    match result {
+                        Ok(response) => responder.respond(response),
+                        Err(error) => {
+                            tracing::warn!(
+                                target: "longbridge_ai_acp::protocol",
+                                session_id = %request.session_id.0,
+                                error = %error,
+                                "ACP prompt request failed without closing the connection"
+                            );
+                            responder.respond_with_error(error)
+                        }
+                    }
                 })?;
                 Ok(())
             },
@@ -1736,6 +1751,8 @@ mod tests {
 
     struct RichBackend;
 
+    struct RejectingBackend;
+
     struct MarkdownChartBackend;
 
     struct StructuredEventsBackend;
@@ -2220,6 +2237,21 @@ mod tests {
     }
 
     #[async_trait]
+    impl AgentBackend for RejectingBackend {
+        type Session = ();
+
+        async fn prompt(
+            &self,
+            _session: (),
+            _prompt: String,
+            _cwd: &Path,
+        ) -> Result<BoxStream<'static, Result<AgentEvent<()>, BackendError>>, BackendError>
+        {
+            Err("Authentication required".into())
+        }
+    }
+
+    #[async_trait]
     impl AgentBackend for MarkdownChartBackend {
         type Session = ();
 
@@ -2381,6 +2413,40 @@ mod tests {
         };
         assert_eq!(method.id.0.as_ref(), "longbridge-login");
         assert_eq!(method.args, ["auth", "login"]);
+    }
+
+    #[tokio::test]
+    async fn rejected_prompt_does_not_close_the_acp_connection() {
+        let response = agent_client_protocol::Client
+            .builder()
+            .connect_with(acp_agent(RejectingBackend), async |connection| {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let session = connection
+                    .send_request(NewSessionRequest::new(std::path::PathBuf::from("/tmp")))
+                    .block_task()
+                    .await?;
+                let error = connection
+                    .send_request(PromptRequest::new(
+                        session.session_id,
+                        vec![ContentBlock::Text(TextContent::new("hello"))],
+                    ))
+                    .block_task()
+                    .await
+                    .expect_err("backend rejection should be a request error");
+                let response = connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                Ok((error, response))
+            })
+            .await
+            .expect("ACP connection should remain available");
+
+        assert!(response.0.to_string().contains("Authentication required"));
+        assert_eq!(response.1.protocol_version, ProtocolVersion::V1);
     }
 
     #[tokio::test]
