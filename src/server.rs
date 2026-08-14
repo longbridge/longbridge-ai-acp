@@ -504,27 +504,15 @@ pub fn acp_agent_with_auth_methods<B: AgentBackend>(
                             record.cancel.subscribe(),
                         )
                     };
-                    let mut events = match backend.prompt(state, prompt, &cwd).await {
-                        Ok(events) => events,
-                        Err(error) => {
-                            // A backend that fails to start a turn must not tear
-                            // down the whole connection. Report the failure to the
-                            // client and end this turn normally so the session
-                            // survives for the next prompt.
-                            tracing::error!(
-                                target: "longbridge_ai_acp::protocol",
-                                session_id = %request.session_id.0,
-                                error = %error,
-                                "ACP backend rejected prompt; ending turn without failing the connection"
-                            );
-                            send_agent_text(
-                                &task_connection,
-                                &request.session_id,
-                                format!("\nThe request could not be completed: {error}\n"),
-                            )?;
-                            return responder.respond(PromptResponse::new(StopReason::EndTurn));
-                        }
-                    };
+                    let mut events = backend.prompt(state, prompt, &cwd).await.map_err(|error| {
+                        tracing::error!(
+                            target: "longbridge_ai_acp::protocol",
+                            session_id = %request.session_id.0,
+                            error = %error,
+                            "ACP backend rejected prompt"
+                        );
+                        agent_client_protocol::Error::internal_error().data(error.to_string())
+                    })?;
 
                     let mut stop_reason = StopReason::EndTurn;
                     let mut rich_text = RichTextFilter::new(request.session_id.0.as_ref());
@@ -564,27 +552,15 @@ pub fn acp_agent_with_auth_methods<B: AgentBackend>(
                             );
                             break;
                         };
-                        let event = match event {
-                            Ok(event) => event,
-                            Err(error) => {
-                                // A mid-stream backend error ends this turn but
-                                // must not kill the connection: surface it to the
-                                // client and finish the turn gracefully.
-                                tracing::error!(
-                                    target: "longbridge_ai_acp::protocol",
-                                    session_id = %request.session_id.0,
-                                    error = %error,
-                                    "ACP backend event stream failed; ending turn without failing the connection"
-                                );
-                                send_agent_text(
-                                    &task_connection,
-                                    &request.session_id,
-                                    format!("\nThe response was interrupted by an error: {error}\n"),
-                                )?;
-                                break;
-                            }
-                        };
-                        match event {
+                        match event.map_err(|error| {
+                            tracing::error!(
+                                target: "longbridge_ai_acp::protocol",
+                                session_id = %request.session_id.0,
+                                error = %error,
+                                "ACP backend event stream failed"
+                            );
+                            agent_client_protocol::Error::internal_error().data(error.to_string())
+                        })? {
                             AgentEvent::UserText(text) => {
                                 task_connection.send_notification(SessionNotification::new(
                                     request.session_id.clone(),
