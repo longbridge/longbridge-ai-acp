@@ -522,7 +522,7 @@ pub fn acp_agent_with_auth_methods<B: AgentBackend>(
                                 &request.session_id,
                                 format!("\nThe request could not be completed: {error}\n"),
                             )?;
-                            return responder.respond(PromptResponse::new(StopReason::EndTurn));
+                            return Ok(PromptResponse::new(StopReason::EndTurn));
                         }
                     };
 
@@ -2452,24 +2452,23 @@ mod tests {
                     .send_request(NewSessionRequest::new(std::path::PathBuf::from("/tmp")))
                     .block_task()
                     .await?;
-                let error = connection
+                let prompt = connection
                     .send_request(PromptRequest::new(
                         session.session_id,
                         vec![ContentBlock::Text(TextContent::new("hello"))],
                     ))
                     .block_task()
-                    .await
-                    .expect_err("backend rejection should be a request error");
+                    .await?;
                 let response = connection
                     .send_request(InitializeRequest::new(ProtocolVersion::V1))
                     .block_task()
                     .await?;
-                Ok((error, response))
+                Ok((prompt, response))
             })
             .await
             .expect("ACP connection should remain available");
 
-        assert!(response.0.to_string().contains("Authentication required"));
+        assert_eq!(response.0.stop_reason, StopReason::EndTurn);
         assert_eq!(response.1.protocol_version, ProtocolVersion::V1);
     }
 
