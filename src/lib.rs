@@ -14,7 +14,7 @@ mod server;
 pub use agent_client_protocol as acp;
 pub use backend::{
     AgentBackend, AgentEvent, AgentPlanEntry, AgentSessionInfo, AgentSessionPage, BackendError,
-    LoadedAgentSession,
+    LoadedAgentSession, Prompt, ATTACHMENT_META_KEY,
 };
 pub use client::{
     with_external_session, with_initialized_session, with_session, AgentHandshake, ClientDelegate,

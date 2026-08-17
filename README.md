@@ -93,3 +93,14 @@ session.shutdown().await;
 
 `DesktopSession::cancel` and `shutdown` are safe UI lifecycle operations. A
 second prompt before `TurnFinished` returns `SessionControlError::Busy`.
+
+To attach files, mark extra content blocks with `ATTACHMENT_META_KEY` and send
+them with `prompt_with_attachments`. The server keeps marked blocks out of the
+flattened text and hands them to the backend via `Prompt::attachments`:
+
+```rust,ignore
+let mut meta = serde_json::Map::new();
+meta.insert(ATTACHMENT_META_KEY.into(), serde_json::json!({"oss_key": "k1"}));
+let file = ContentBlock::ResourceLink(ResourceLink::new("chart.png", "oss://k1").meta(meta));
+session.prompt_with_attachments("What is in this image?", vec![file]).await?;
+```

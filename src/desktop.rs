@@ -1,6 +1,7 @@
 use crate::{with_initialized_session, AgentHandshake, ClientDelegate};
 use agent_client_protocol::schema::v1::{
-    CancelNotification, SessionNotification, SessionUpdate, StopReason,
+    CancelNotification, ContentBlock, PromptRequest, PromptResponse, SessionNotification,
+    SessionUpdate, StopReason,
 };
 use agent_client_protocol::{
     util::MatchDispatch, ActiveSession, Agent, Client, ConnectTo, SessionMessage,
@@ -10,11 +11,35 @@ use tokio::sync::{mpsc, oneshot};
 
 enum SessionCommand {
     Prompt {
-        text: String,
+        blocks: Vec<ContentBlock>,
         accepted: oneshot::Sender<Result<(), SessionControlError>>,
     },
     Cancel,
     Shutdown,
+}
+
+/// A text block followed by the attachment blocks, in prompt order.
+fn prompt_blocks(text: impl Into<String>, attachments: Vec<ContentBlock>) -> Vec<ContentBlock> {
+    let mut blocks = Vec::with_capacity(attachments.len() + 1);
+    blocks.push(ContentBlock::from(text.into()));
+    blocks.extend(attachments);
+    blocks
+}
+
+async fn send_prompt_command(
+    commands: &mpsc::UnboundedSender<SessionCommand>,
+    blocks: Vec<ContentBlock>,
+) -> Result<(), SessionControlError> {
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    commands
+        .send(SessionCommand::Prompt {
+            blocks,
+            accepted: accepted_tx,
+        })
+        .map_err(|_| SessionControlError::Closed)?;
+    accepted_rx
+        .await
+        .unwrap_or(Err(SessionControlError::Closed))
 }
 
 /// Events emitted by a long-lived desktop ACP session.
@@ -113,16 +138,20 @@ impl DesktopSession {
 
     /// Start a turn. A second prompt is rejected until `TurnFinished` arrives.
     pub async fn prompt(&self, text: impl Into<String>) -> Result<(), SessionControlError> {
-        let (accepted_tx, accepted_rx) = oneshot::channel();
-        self.commands
-            .send(SessionCommand::Prompt {
-                text: text.into(),
-                accepted: accepted_tx,
-            })
-            .map_err(|_| SessionControlError::Closed)?;
-        accepted_rx
-            .await
-            .unwrap_or(Err(SessionControlError::Closed))
+        send_prompt_command(&self.commands, prompt_blocks(text, Vec::new())).await
+    }
+
+    /// Start a turn whose prompt carries attachment blocks after the text.
+    ///
+    /// Attachments should be marked with [`crate::ATTACHMENT_META_KEY`] so the
+    /// server routes them to [`crate::Prompt::attachments`] instead of the
+    /// flattened text.
+    pub async fn prompt_with_attachments(
+        &self,
+        text: impl Into<String>,
+        attachments: Vec<ContentBlock>,
+    ) -> Result<(), SessionControlError> {
+        send_prompt_command(&self.commands, prompt_blocks(text, attachments)).await
     }
 
     /// Request cancellation of the active turn. It is a no-op while idle.
@@ -177,16 +206,18 @@ impl DesktopSessionHandle {
     }
 
     pub async fn prompt(&self, text: impl Into<String>) -> Result<(), SessionControlError> {
-        let (accepted_tx, accepted_rx) = oneshot::channel();
-        self.commands
-            .send(SessionCommand::Prompt {
-                text: text.into(),
-                accepted: accepted_tx,
-            })
-            .map_err(|_| SessionControlError::Closed)?;
-        accepted_rx
-            .await
-            .unwrap_or(Err(SessionControlError::Closed))
+        send_prompt_command(&self.commands, prompt_blocks(text, Vec::new())).await
+    }
+
+    /// Start a turn whose prompt carries attachment blocks after the text.
+    ///
+    /// See [`DesktopSession::prompt_with_attachments`].
+    pub async fn prompt_with_attachments(
+        &self,
+        text: impl Into<String>,
+        attachments: Vec<ContentBlock>,
+    ) -> Result<(), SessionControlError> {
+        send_prompt_command(&self.commands, prompt_blocks(text, attachments)).await
     }
 
     pub fn cancel(&self) -> Result<(), SessionControlError> {
@@ -224,10 +255,25 @@ async fn drive_session(
 ) -> Result<(), agent_client_protocol::Error> {
     while let Some(command) = commands.recv().await {
         match command {
-            SessionCommand::Prompt { text, accepted } => {
-                session.send_prompt(text)?;
+            SessionCommand::Prompt { blocks, accepted } => {
+                // The SDK's `send_prompt` only supports a single text block, so
+                // build the request here and route the terminal `PromptResponse`
+                // through an actor-owned channel instead of the SDK's private one.
+                let (stop_tx, stop_rx) = oneshot::channel();
+                session
+                    .connection()
+                    .send_request_to(
+                        Agent,
+                        PromptRequest::new(session.session_id().clone(), blocks),
+                    )
+                    .on_receiving_result(
+                        async move |result: agent_client_protocol::Result<PromptResponse>| {
+                            let _ = stop_tx.send(result.map(|response| response.stop_reason));
+                            Ok(())
+                        },
+                    )?;
                 let _ = accepted.send(Ok(()));
-                if !drive_turn(&mut session, &mut commands, &events).await? {
+                if !drive_turn(&mut session, &mut commands, &events, stop_rx).await? {
                     break;
                 }
             }
@@ -242,11 +288,19 @@ async fn drive_turn(
     session: &mut ActiveSession<'_, Agent>,
     commands: &mut mpsc::UnboundedReceiver<SessionCommand>,
     events: &mpsc::UnboundedSender<DesktopSessionEvent>,
+    mut stop_rx: oneshot::Receiver<agent_client_protocol::Result<StopReason>>,
 ) -> Result<bool, agent_client_protocol::Error> {
     loop {
+        // Biased order matters: session updates and the prompt response arrive
+        // on separate channels, so pending updates must drain before the turn
+        // is declared finished — otherwise a queued chunk leaks into the next
+        // turn.
         tokio::select! {
-            message = session.read_update() => match message? {
-                SessionMessage::SessionMessage(dispatch) => {
+            biased;
+            message = session.read_update() => {
+                // The terminal stop reason arrives via `stop_rx`; the SDK's own
+                // `StopReason` message is only produced by `send_prompt`.
+                if let SessionMessage::SessionMessage(dispatch) = message? {
                     let events = events.clone();
                     MatchDispatch::new(dispatch)
                         .if_notification(async move |notification: SessionNotification| {
@@ -256,12 +310,13 @@ async fn drive_turn(
                         .await
                         .otherwise_ignore()?;
                 }
-                SessionMessage::StopReason(reason) => {
-                    let _ = events.send(DesktopSessionEvent::TurnFinished(reason));
-                    return Ok(true);
-                }
-                _ => {}
             },
+            outcome = &mut stop_rx => {
+                let reason = outcome
+                    .map_err(|_| agent_client_protocol::Error::internal_error())??;
+                let _ = events.send(DesktopSessionEvent::TurnFinished(reason));
+                return Ok(true);
+            }
             command = commands.recv() => match command {
                 Some(SessionCommand::Cancel) => {
                     session.connection().send_notification(
@@ -285,10 +340,11 @@ async fn drive_turn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{acp_agent, AgentBackend, AgentEvent, BackendError, DenyPermissions};
-    use agent_client_protocol::schema::v1::{ContentBlock, ContentChunk};
+    use crate::{acp_agent, AgentBackend, AgentEvent, BackendError, DenyPermissions, Prompt};
+    use agent_client_protocol::schema::v1::{ContentBlock, ContentChunk, ResourceLink};
     use async_trait::async_trait;
     use futures::{stream, stream::BoxStream};
+    use serde_json::Map;
     use std::path::Path;
 
     struct Echo;
@@ -301,12 +357,16 @@ mod tests {
         async fn prompt(
             &self,
             session: (),
-            prompt: String,
+            prompt: Prompt,
             _cwd: &Path,
         ) -> Result<BoxStream<'static, Result<AgentEvent<()>, BackendError>>, BackendError>
         {
             Ok(Box::pin(stream::iter([
-                Ok(AgentEvent::Text(format!("echo: {prompt}"))),
+                Ok(AgentEvent::Text(format!(
+                    "echo: {} attachments={}",
+                    prompt.text,
+                    prompt.attachments.len()
+                ))),
                 Ok(AgentEvent::Finished(session)),
             ])))
         }
@@ -319,7 +379,7 @@ mod tests {
         async fn prompt(
             &self,
             _session: (),
-            _prompt: String,
+            _prompt: Prompt,
             _cwd: &Path,
         ) -> Result<BoxStream<'static, Result<AgentEvent<()>, BackendError>>, BackendError>
         {
@@ -347,7 +407,7 @@ mod tests {
             else {
                 panic!("expected text update");
             };
-            assert_eq!(text.text, format!("echo: {prompt}"));
+            assert_eq!(text.text, format!("echo: {prompt} attachments=0"));
             assert!(matches!(
                 session.next_event().await,
                 Some(DesktopSessionEvent::TurnFinished(StopReason::EndTurn))
@@ -374,6 +434,44 @@ mod tests {
             Some(DesktopSessionEvent::TurnFinished(_))
         ));
         events.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn prompt_with_attachments_reaches_backend() {
+        let mut session =
+            DesktopSession::connect(acp_agent(Echo), "/tmp", Arc::new(DenyPermissions))
+                .await
+                .expect("desktop session");
+
+        let mut meta = Map::new();
+        meta.insert(
+            crate::ATTACHMENT_META_KEY.into(),
+            serde_json::json!({"oss_key": "k1"}),
+        );
+        let attachment =
+            ContentBlock::ResourceLink(ResourceLink::new("chart.png", "oss://k1").meta(meta));
+        session
+            .prompt_with_attachments("with files", vec![attachment])
+            .await
+            .expect("accepted prompt");
+
+        let update = session.next_event().await.expect("message update");
+        let DesktopSessionEvent::Update(update) = update else {
+            panic!("expected update");
+        };
+        let SessionUpdate::AgentMessageChunk(ContentChunk {
+            content: ContentBlock::Text(text),
+            ..
+        }) = *update
+        else {
+            panic!("expected text update");
+        };
+        assert_eq!(text.text, "echo: with files attachments=1");
+        assert!(matches!(
+            session.next_event().await,
+            Some(DesktopSessionEvent::TurnFinished(StopReason::EndTurn))
+        ));
+        session.shutdown().await;
     }
 
     #[tokio::test]
