@@ -2390,13 +2390,14 @@ mod tests {
         async fn prompt(
             &self,
             session: TestSession,
-            prompt: String,
+            prompt: Prompt,
             _cwd: &Path,
         ) -> Result<BoxStream<'static, Result<AgentEvent<TestSession>, BackendError>>, BackendError>
         {
             Ok(Box::pin(stream::iter([Ok(AgentEvent::Text(format!(
-                "continued {}: {prompt}",
-                session.conversation_id.unwrap_or_default()
+                "continued {}: {}",
+                session.conversation_id.unwrap_or_default(),
+                prompt.text
             )))])))
         }
     }
