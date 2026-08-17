@@ -713,7 +713,7 @@ mod tests {
         let svg = chart.svg.unwrap();
         assert!(svg.contains("Vendor A"));
         assert!(svg.contains("Vendor B"));
-        assert_eq!(svg.matches("fill-opacity=\".25\"").count(), 2);
+        assert_eq!(svg.matches("fill-opacity=\".22\"").count(), 2);
     }
 
     #[test]
@@ -724,7 +724,8 @@ mod tests {
         )
         .unwrap();
         let svg = chart.svg.unwrap();
-        assert!(svg.contains("rect class=\"mark\""));
+        // Bars are now coloured per-index from the palette, not the flat teal mark.
+        assert!(svg.contains("<rect fill=\"#16a3a5\""));
         assert!(svg.contains("\u{2013}"), "bin labels show ranges");
     }
 

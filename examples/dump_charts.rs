@@ -61,6 +61,21 @@ fn main() {
             "edges": [ { "source": "Order", "target": "Pay", "name": "checkout" },
                        { "source": "Pay", "target": "Review" }, { "source": "Review", "target": "Ship" },
                        { "source": "Ship", "target": "Done" } ] } }),
+        json!({ "type": "column", "title": "Quarterly revenue", "data": [
+            { "category": "Q1", "value": 91 }, { "category": "Q2", "value": 99 },
+            { "category": "Q3", "value": 116 }, { "category": "Q4", "value": 135 } ] }),
+        json!({ "type": "bar", "title": "Sales by region", "data": [
+            { "category": "East", "value": 850 }, { "category": "South", "value": 620 },
+            { "category": "North", "value": 580 }, { "category": "West", "value": 420 } ] }),
+        json!({ "type": "line", "title": "Monthly active users", "data": [
+            { "category": "Jan", "value": 100 }, { "category": "Feb", "value": 118 },
+            { "category": "Mar", "value": 132 }, { "category": "Apr", "value": 155 } ] }),
+        json!({ "type": "area", "title": "Annual revenue", "data": [
+            { "category": "2021", "value": 50 }, { "category": "2022", "value": 78 },
+            { "category": "2023", "value": 96 }, { "category": "2024", "value": 120 } ] }),
+        json!({ "type": "pie", "title": "Product sales share", "data": [
+            { "category": "Phone", "value": 45 }, { "category": "Laptop", "value": 25 },
+            { "category": "Tablet", "value": 15 }, { "category": "Other", "value": 15 } ] }),
     ];
     for sample in samples {
         let name = sample["type"].as_str().unwrap().to_owned();
