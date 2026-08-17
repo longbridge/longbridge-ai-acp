@@ -178,7 +178,8 @@ fn render_grouped_columns(data: &Value, items: &[Value]) -> String {
     }
     let category_width = 600.0 / usize_as_f64(categories.len().max(1));
     let bar_width = (category_width - 16.0) / usize_as_f64(groups.len().max(1));
-    let mut body = String::from(r#"<line class="grid" x1="60" y1="390" x2="680" y2="390"/>"#);
+    let (max, grid) = column_value_axis(max, 60.0, 680.0, 100.0, 390.0);
+    let mut body = grid;
     for (category_index, category) in categories.iter().enumerate() {
         for (group_index, group) in groups.iter().enumerate() {
             let value = values
@@ -251,7 +252,8 @@ fn render_stacked_columns(data: &Value, items: &[Value]) -> String {
     }
     let category_width = 600.0 / usize_as_f64(categories.len().max(1));
     let bar_width = (category_width - 24.0).max(6.0);
-    let mut body = String::from(r#"<line class="grid" x1="60" y1="390" x2="680" y2="390"/>"#);
+    let (max_total, grid) = column_value_axis(max_total, 60.0, 680.0, 100.0, 390.0);
+    let mut body = grid;
     for (category_index, category) in categories.iter().enumerate() {
         let x = 70.0 + usize_as_f64(category_index) * category_width;
         let mut y = 390.0_f64;
@@ -355,14 +357,63 @@ fn svg_shell(data: &Value, body: &str) -> String {
     )
 }
 
+/// A "nice" round upper bound at or above `max`, so the value axis ends on a
+/// number worth labelling (1 / 2 / 2.5 / 5 × 10ⁿ) rather than the raw maximum.
+fn nice_ceil(max: f64) -> f64 {
+    if !max.is_finite() || max <= 0.0 {
+        return 1.0;
+    }
+    let power = 10f64.powf(max.log10().floor());
+    for step in [1.0, 2.0, 2.5, 5.0] {
+        if step * power >= max * (1.0 - 1e-9) {
+            return step * power;
+        }
+    }
+    10.0 * power
+}
+
+/// An axis tick label: a whole number when it is one, else one decimal.
+fn format_tick(value: f64) -> String {
+    if (value.round() - value).abs() < 1e-6 {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.1}")
+    }
+}
+
+/// Horizontal gridlines and left-hand value labels for a column-style chart.
+///
+/// Returns the nice axis maximum the bars should scale against and the grid SVG,
+/// so a column reads its height off a labelled scale the way the web renderer's
+/// does, instead of floating above a lone baseline.
+fn column_value_axis(max: f64, left: f64, right: f64, top: f64, baseline: f64) -> (f64, String) {
+    let nice = nice_ceil(max);
+    let mut svg = String::new();
+    let ticks = 4;
+    for tick in 0..=ticks {
+        let frac = f64::from(tick) / f64::from(ticks);
+        let y = baseline - frac * (baseline - top);
+        write!(
+            svg,
+            r#"<line class="grid" x1="{left:.1}" y1="{y:.1}" x2="{right:.1}" y2="{y:.1}"/><text x="{:.1}" y="{:.1}" text-anchor="end" style="font-size:12px;fill:#94a3b8">{}</text>"#,
+            left - 8.0,
+            y + 4.0,
+            format_tick(nice * frac)
+        )
+        .expect("writing to a String cannot fail");
+    }
+    (nice, svg)
+}
+
 fn render_columns(data: &Value, points: &[(String, f64)]) -> String {
-    let max = points
+    let raw_max = points
         .iter()
         .map(|(_, value)| value.abs())
         .fold(0.0, f64::max)
         .max(1.0);
     let width = 680.0 / usize_as_f64(points.len());
-    let mut body = String::from(r#"<line class="grid" x1="60" y1="390" x2="760" y2="390"/>"#);
+    let (max, grid) = column_value_axis(raw_max, 60.0, 760.0, 90.0, 390.0);
+    let mut body = grid;
     for (index, (label, value)) in points.iter().enumerate() {
         let height = value.abs() / max * 300.0;
         let x = 70.0 + usize_as_f64(index) * width;
@@ -373,14 +424,35 @@ fn render_columns(data: &Value, points: &[(String, f64)]) -> String {
     svg_shell(data, &body)
 }
 
+/// Vertical gridlines and bottom value labels for a horizontal (bar) chart, the
+/// sideways twin of [`column_value_axis`].
+fn bar_value_axis(max: f64, left: f64, right: f64, top: f64, bottom: f64) -> (f64, String) {
+    let nice = nice_ceil(max);
+    let mut svg = String::new();
+    let ticks = 4;
+    for tick in 0..=ticks {
+        let frac = f64::from(tick) / f64::from(ticks);
+        let x = left + frac * (right - left);
+        write!(
+            svg,
+            r#"<line class="grid" x1="{x:.1}" y1="{top:.1}" x2="{x:.1}" y2="{bottom:.1}"/><text x="{x:.1}" y="{:.1}" text-anchor="middle" style="font-size:12px;fill:#94a3b8">{}</text>"#,
+            bottom + 18.0,
+            format_tick(nice * frac)
+        )
+        .expect("writing to a String cannot fail");
+    }
+    (nice, svg)
+}
+
 fn render_bars(data: &Value, points: &[(String, f64)]) -> String {
-    let max = points
+    let raw_max = points
         .iter()
         .map(|(_, value)| value.abs())
         .fold(0.0, f64::max)
         .max(1.0);
     let height = 330.0 / usize_as_f64(points.len());
-    let mut body = String::new();
+    let (max, grid) = bar_value_axis(raw_max, 165.0, 725.0, 50.0, 390.0);
+    let mut body = grid;
     for (index, (label, value)) in points.iter().enumerate() {
         let width = value.abs() / max * 560.0;
         let y = 60.0 + usize_as_f64(index) * height;
@@ -391,15 +463,23 @@ fn render_bars(data: &Value, points: &[(String, f64)]) -> String {
 }
 
 fn render_plot(data: &Value, points: &[(String, f64)], chart_type: &str) -> String {
-    let min = points
+    let raw_min = points
         .iter()
         .map(|(_, value)| *value)
         .fold(f64::INFINITY, f64::min);
-    let max = points
+    let raw_max = points
         .iter()
         .map(|(_, value)| *value)
         .fold(f64::NEG_INFINITY, f64::max);
-    let range = (max - min).max(1.0);
+    // Non-negative series get a zero-based value axis with labelled gridlines, like
+    // the web renderer; a series that dips below zero keeps the min–max framing so
+    // the dip stays visible.
+    let (grid, min, range) = if raw_min >= 0.0 {
+        let (nice, grid) = column_value_axis(raw_max.max(1.0), 60.0, 760.0, 90.0, 390.0);
+        (grid, 0.0, nice)
+    } else {
+        (String::new(), raw_min, (raw_max - raw_min).max(1.0))
+    };
     let step = 680.0 / usize_as_f64(points.len().saturating_sub(1).max(1));
     let coordinates = points
         .iter()
@@ -417,17 +497,19 @@ fn render_plot(data: &Value, points: &[(String, f64)], chart_type: &str) -> Stri
         .map(|(index, (x, y))| format!("{} {x:.1} {y:.1}", if index == 0 { "M" } else { "L" }))
         .collect::<Vec<_>>()
         .join(" ");
-    let mut body = if chart_type == "area" {
+    let mut body = grid;
+    if chart_type == "area" {
         let gradient = gradient_prefix(data);
-        format!(
+        write!(
+            body,
             r#"<defs>{}</defs><path d="{path} L 740 390 L 60 390 Z" fill="url(#{gradient})"/><path class="line" d="{path}"/>"#,
             area_gradient(&gradient, "#00b7b7")
         )
+        .expect("writing to a String cannot fail");
     } else if chart_type == "line" {
-        format!(r#"<path class="line" d="{path}"/>"#)
-    } else {
-        String::new()
-    };
+        write!(body, r#"<path class="line" d="{path}"/>"#)
+            .expect("writing to a String cannot fail");
+    }
     for (index, ((label, _), (x, y))) in points.iter().zip(&coordinates).enumerate() {
         write!(body, r#"<circle class="mark" cx="{x:.1}" cy="{y:.1}" r="4"/><text x="{x:.1}" y="415" text-anchor="middle">{}</text>"#, if points.len() <= 10 || index % 2 == 0 { xml_escape(label) } else { String::new() }).expect("writing to a String cannot fail");
     }
@@ -472,14 +554,21 @@ fn render_multi_plot(data: &Value, items: &[Value], chart_type: &str) -> Option<
     if categories.is_empty() || groups.is_empty() {
         return None;
     }
-    let (mut min, mut max) = (f64::INFINITY, f64::NEG_INFINITY);
+    let (mut raw_min, mut raw_max) = (f64::INFINITY, f64::NEG_INFINITY);
     for (_, series) in &groups {
         for (_, value) in series {
-            min = min.min(*value);
-            max = max.max(*value);
+            raw_min = raw_min.min(*value);
+            raw_max = raw_max.max(*value);
         }
     }
-    let range = (max - min).max(1.0);
+    // Non-negative series get a zero-based labelled value axis; otherwise keep the
+    // min–max framing so a dip below zero stays on screen.
+    let (grid, min, range) = if raw_min >= 0.0 {
+        let (nice, grid) = column_value_axis(raw_max.max(1.0), 60.0, 700.0, 90.0, 390.0);
+        (grid, 0.0, nice)
+    } else {
+        (String::new(), raw_min, (raw_max - raw_min).max(1.0))
+    };
     let step = 640.0 / usize_as_f64(categories.len().saturating_sub(1).max(1));
     let scale = |column: usize, value: f64| {
         (
@@ -487,7 +576,7 @@ fn render_multi_plot(data: &Value, items: &[Value], chart_type: &str) -> Option<
             390.0 - (value - min) / range * 300.0,
         )
     };
-    let mut body = String::new();
+    let mut body = grid;
     let gradient_base = gradient_prefix(data);
     if chart_type == "area" {
         body.push_str("<defs>");
