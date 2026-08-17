@@ -539,6 +539,7 @@ pub fn acp_agent_with_auth_methods<B: AgentBackend>(
                             }
                             event = events.next() => event,
                             () = tokio::time::sleep(BACKEND_INACTIVITY_TIMEOUT) => {
+                                let timed_out_tools = active_tools.len();
                                 tracing::warn!(target: "longbridge_ai_acp::protocol", session_id = %request.session_id.0, active_tools = active_tools.len(), timeout_seconds = BACKEND_INACTIVITY_TIMEOUT.as_secs(), "ACP backend event stream timed out");
                                 for (id, title) in active_tools.drain() {
                                     task_connection.send_notification(SessionNotification::new(
@@ -552,6 +553,13 @@ pub fn acp_agent_with_auth_methods<B: AgentBackend>(
                                         )),
                                     ))?;
                                 }
+                                task_connection.send_notification(SessionNotification::new(
+                                    request.session_id.clone(),
+                                    backend_timeout_update(
+                                        BACKEND_INACTIVITY_TIMEOUT.as_secs(),
+                                        timed_out_tools,
+                                    ),
+                                ))?;
                                 send_agent_text(&task_connection, &request.session_id, "\nThe backend stopped responding for 60 seconds. The current operation was timed out so this ACP turn can finish.\n".to_string())?;
                                 break;
                             }
@@ -1040,6 +1048,18 @@ fn send_agent_text(
             text,
         )))),
     ))
+}
+
+fn backend_timeout_update(timeout_seconds: u64, active_tools: usize) -> SessionUpdate {
+    SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+        TextContent::new(String::new()).meta(longbridge_meta(serde_json::json!({
+            "event": "backend_timeout",
+            "data": {
+                "timeout_seconds": timeout_seconds,
+                "active_tools": active_tools,
+            },
+        }))),
+    )))
 }
 
 enum FilteredContent {
@@ -1798,6 +1818,26 @@ mod tests {
             tool_failure_message("Quote", None),
             "\nTool ‘Quote’ failed.\n"
         );
+    }
+
+    #[test]
+    fn backend_timeout_update_exposes_machine_readable_metadata() {
+        let update = backend_timeout_update(60, 2);
+        let SessionUpdate::AgentMessageChunk(chunk) = update else {
+            panic!("expected an agent message chunk");
+        };
+        let ContentBlock::Text(text) = chunk.content else {
+            panic!("expected text content");
+        };
+        let event = text
+            .meta
+            .expect("timeout metadata")
+            .get("longbridge.ai/event")
+            .cloned()
+            .expect("timeout event");
+        assert_eq!(event["event"], "backend_timeout");
+        assert_eq!(event["data"]["timeout_seconds"], 60);
+        assert_eq!(event["data"]["active_tools"], 2);
     }
 
     #[test]
