@@ -1,4 +1,7 @@
-use crate::{rich_content::chart_markdown_fallback, AgentBackend, AgentEvent, RichContent};
+use crate::{
+    rich_content::chart_markdown_fallback, AgentBackend, AgentEvent, Prompt, RichContent,
+    ATTACHMENT_META_KEY,
+};
 use agent_client_protocol::schema::{
     v1::{
         AgentCapabilities, AuthMethod, CancelNotification, ContentBlock, ContentChunk,
@@ -39,18 +42,46 @@ fn standard_rich_chunks(
         .collect()
 }
 
-fn flatten_prompt(blocks: &[ContentBlock]) -> agent_client_protocol::Result<String> {
-    blocks
-        .iter()
-        .map(|block| match block {
-            ContentBlock::Text(text) => Ok(text.text.clone()),
+fn block_meta(block: &ContentBlock) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    match block {
+        ContentBlock::Text(content) => content.meta.as_ref(),
+        ContentBlock::Image(content) => content.meta.as_ref(),
+        ContentBlock::Audio(content) => content.meta.as_ref(),
+        ContentBlock::ResourceLink(content) => content.meta.as_ref(),
+        ContentBlock::Resource(content) => content.meta.as_ref(),
+        _ => None,
+    }
+}
+
+fn is_attachment(block: &ContentBlock) -> bool {
+    block_meta(block).is_some_and(|meta| meta.contains_key(ATTACHMENT_META_KEY))
+}
+
+/// Splits a prompt into flattened text and attachment blocks.
+///
+/// Blocks marked with [`ATTACHMENT_META_KEY`] are collected verbatim and kept
+/// out of the text. Unmarked media blocks are still rejected because the
+/// server does not advertise the matching prompt capabilities.
+fn split_prompt(blocks: &[ContentBlock]) -> agent_client_protocol::Result<Prompt> {
+    let mut parts = Vec::new();
+    let mut attachments = Vec::new();
+    for block in blocks {
+        if is_attachment(block) {
+            attachments.push(block.clone());
+            continue;
+        }
+        match block {
+            ContentBlock::Text(text) => parts.push(text.text.clone()),
             ContentBlock::ResourceLink(resource) => {
-                Ok(format!("{}: {}", resource.name, resource.uri))
+                parts.push(format!("{}: {}", resource.name, resource.uri));
             }
-            _ => Err(agent_client_protocol::Error::invalid_params()),
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map(|parts| parts.join("\n"))
+            _ => return Err(agent_client_protocol::Error::invalid_params()),
+        }
+    }
+    Ok(Prompt {
+        text: parts.join("\n"),
+        attachments,
+    })
 }
 
 fn history_updates<Session>(
@@ -469,7 +500,7 @@ pub fn acp_agent_with_auth_methods<B: AgentBackend>(
             async move |request: PromptRequest,
                         responder: Responder<PromptResponse>,
                         connection: ConnectionTo<Client>| {
-                let prompt = match flatten_prompt(&request.prompt) {
+                let prompt = match split_prompt(&request.prompt) {
                     Ok(prompt) => prompt,
                     Err(error) => {
                         tracing::warn!(
@@ -485,7 +516,8 @@ pub fn acp_agent_with_auth_methods<B: AgentBackend>(
                     target: "longbridge_ai_acp::protocol",
                     session_id = %request.session_id.0,
                     blocks = request.prompt.len(),
-                    prompt_chars = prompt.chars().count(),
+                    attachments = prompt.attachments.len(),
+                    prompt_chars = prompt.text.chars().count(),
                     "ACP prompt request received"
                 );
                 let prompt_sessions = Arc::clone(&prompt_sessions);
@@ -953,7 +985,7 @@ pub fn acp_agent_with_auth_methods<B: AgentBackend>(
                                         if selected.option_id.0.as_ref() == "allow"
                                 );
                                 events = backend
-                                    .prompt(session, authorized.to_string(), &cwd)
+                                    .prompt(session, authorized.to_string().into(), &cwd)
                                     .await
                                     .map_err(|error| {
                                         tracing::error!(target: "longbridge_ai_acp::protocol", session_id = %request.session_id.0, error = %error, "ACP backend failed to resume after permission");
@@ -1831,6 +1863,7 @@ mod tests {
     use agent_client_protocol::schema::v1::{ImageContent, ResourceLink};
     use async_trait::async_trait;
     use futures::{stream, stream::BoxStream};
+    use serde_json::Map;
     use std::{path::Path, sync::Mutex};
 
     #[derive(Default)]
@@ -2270,7 +2303,7 @@ mod tests {
         async fn prompt(
             &self,
             _session: (),
-            _prompt: String,
+            _prompt: Prompt,
             _cwd: &Path,
         ) -> Result<BoxStream<'static, Result<AgentEvent<()>, BackendError>>, BackendError>
         {
@@ -2323,13 +2356,14 @@ mod tests {
         async fn prompt(
             &self,
             session: TestSession,
-            prompt: String,
+            prompt: Prompt,
             _cwd: &Path,
         ) -> Result<BoxStream<'static, Result<AgentEvent<TestSession>, BackendError>>, BackendError>
         {
             assert_eq!(session.conversation_id.as_deref(), Some("chat-1"));
             Ok(Box::pin(stream::iter([Ok(AgentEvent::Text(format!(
-                "continued: {prompt}"
+                "continued: {}",
+                prompt.text
             )))])))
         }
     }
@@ -2356,13 +2390,14 @@ mod tests {
         async fn prompt(
             &self,
             session: TestSession,
-            prompt: String,
+            prompt: Prompt,
             _cwd: &Path,
         ) -> Result<BoxStream<'static, Result<AgentEvent<TestSession>, BackendError>>, BackendError>
         {
             Ok(Box::pin(stream::iter([Ok(AgentEvent::Text(format!(
-                "continued {}: {prompt}",
-                session.conversation_id.unwrap_or_default()
+                "continued {}: {}",
+                session.conversation_id.unwrap_or_default(),
+                prompt.text
             )))])))
         }
     }
@@ -2374,7 +2409,7 @@ mod tests {
         async fn prompt(
             &self,
             _session: (),
-            _prompt: String,
+            _prompt: Prompt,
             _cwd: &Path,
         ) -> Result<BoxStream<'static, Result<AgentEvent<()>, BackendError>>, BackendError>
         {
@@ -2396,7 +2431,7 @@ mod tests {
         async fn prompt(
             &self,
             _session: (),
-            _prompt: String,
+            _prompt: Prompt,
             _cwd: &Path,
         ) -> Result<BoxStream<'static, Result<AgentEvent<()>, BackendError>>, BackendError>
         {
@@ -2411,7 +2446,7 @@ mod tests {
         async fn prompt(
             &self,
             _session: (),
-            _prompt: String,
+            _prompt: Prompt,
             _cwd: &Path,
         ) -> Result<BoxStream<'static, Result<AgentEvent<()>, BackendError>>, BackendError>
         {
@@ -2438,14 +2473,14 @@ mod tests {
         async fn prompt(
             &self,
             session: TestSession,
-            prompt: String,
+            prompt: Prompt,
             _cwd: &Path,
         ) -> Result<BoxStream<'static, Result<AgentEvent<TestSession>, BackendError>>, BackendError>
         {
             self.seen.lock().expect("mutex").push(session);
             Ok(Box::pin(stream::iter([
                 Ok(AgentEvent::Thought("checking".into())),
-                Ok(AgentEvent::Text(format!("answer: {prompt}"))),
+                Ok(AgentEvent::Text(format!("answer: {}", prompt.text))),
                 Ok(AgentEvent::Finished(TestSession {
                     conversation_id: Some("chat-1".into()),
                 })),
@@ -2460,7 +2495,7 @@ mod tests {
         async fn prompt(
             &self,
             _session: (),
-            _prompt: String,
+            _prompt: Prompt,
             _cwd: &Path,
         ) -> Result<BoxStream<'static, Result<AgentEvent<()>, BackendError>>, BackendError>
         {
@@ -2503,7 +2538,7 @@ mod tests {
         async fn prompt(
             &self,
             _session: (),
-            _prompt: String,
+            _prompt: Prompt,
             _cwd: &Path,
         ) -> Result<BoxStream<'static, Result<AgentEvent<()>, BackendError>>, BackendError>
         {
@@ -3070,23 +3105,62 @@ mod tests {
     }
 
     #[test]
-    fn prompt_flattener_preserves_text_and_resource_links() {
-        let prompt = flatten_prompt(&[
+    fn prompt_splitter_preserves_text_and_resource_links() {
+        let prompt = split_prompt(&[
             ContentBlock::Text(TextContent::new("review this")),
             ContentBlock::ResourceLink(ResourceLink::new("proposal", "file:///tmp/proposal.md")),
         ])
         .expect("supported prompt");
 
-        assert_eq!(prompt, "review this\nproposal: file:///tmp/proposal.md");
+        assert_eq!(
+            prompt.text,
+            "review this\nproposal: file:///tmp/proposal.md"
+        );
+        assert!(prompt.attachments.is_empty());
     }
 
     #[test]
-    fn prompt_flattener_rejects_unadvertised_media() {
-        let error = flatten_prompt(&[ContentBlock::Image(ImageContent::new(
+    fn prompt_splitter_rejects_unadvertised_media() {
+        let error = split_prompt(&[ContentBlock::Image(ImageContent::new(
             "base64",
             "image/png",
         ))]);
 
         assert!(error.is_err());
+    }
+
+    #[test]
+    fn prompt_splitter_routes_attachment_blocks_out_of_the_text() {
+        let mut meta = Map::new();
+        meta.insert(
+            crate::ATTACHMENT_META_KEY.into(),
+            serde_json::json!({"oss_key": "k1", "name": "chart.png"}),
+        );
+        let prompt = split_prompt(&[
+            ContentBlock::Text(TextContent::new("what is in this image?")),
+            ContentBlock::ResourceLink(ResourceLink::new("chart.png", "oss://k1").meta(meta)),
+        ])
+        .expect("supported prompt");
+
+        assert_eq!(prompt.text, "what is in this image?");
+        assert_eq!(prompt.attachments.len(), 1);
+        let ContentBlock::ResourceLink(link) = &prompt.attachments[0] else {
+            panic!("expected the resource link back");
+        };
+        assert_eq!(link.uri, "oss://k1");
+    }
+
+    #[test]
+    fn prompt_splitter_accepts_marked_media_blocks() {
+        let mut meta = Map::new();
+        meta.insert(crate::ATTACHMENT_META_KEY.into(), serde_json::Value::Null);
+        let prompt = split_prompt(&[
+            ContentBlock::Text(TextContent::new("look")),
+            ContentBlock::Image(ImageContent::new("base64", "image/png").meta(meta)),
+        ])
+        .expect("marked media is an attachment");
+
+        assert_eq!(prompt.text, "look");
+        assert_eq!(prompt.attachments.len(), 1);
     }
 }

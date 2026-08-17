@@ -1,9 +1,41 @@
+use agent_client_protocol::schema::v1::ContentBlock;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 pub type BackendError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+/// `_meta` key marking a prompt content block as a structured attachment.
+///
+/// Blocks carrying this key are routed to [`Prompt::attachments`] verbatim
+/// instead of being flattened into [`Prompt::text`], so backends can recover
+/// provider-native file payloads losslessly.
+pub const ATTACHMENT_META_KEY: &str = "longbridge.ai/attachment";
+
+/// A user prompt split into flattened text and structured attachments.
+#[derive(Clone, Debug, Default)]
+pub struct Prompt {
+    /// Text flattened from the prompt's text-bearing content blocks.
+    pub text: String,
+    /// Content blocks marked with [`ATTACHMENT_META_KEY`], in prompt order.
+    pub attachments: Vec<ContentBlock>,
+}
+
+impl From<String> for Prompt {
+    fn from(text: String) -> Self {
+        Self {
+            text,
+            attachments: Vec::new(),
+        }
+    }
+}
+
+impl From<&str> for Prompt {
+    fn from(text: &str) -> Self {
+        text.to_owned().into()
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AgentPlanEntry {
@@ -162,7 +194,7 @@ pub trait AgentBackend: Send + Sync + 'static {
     async fn prompt(
         &self,
         session: Self::Session,
-        prompt: String,
+        prompt: Prompt,
         cwd: &Path,
     ) -> Result<BoxStream<'static, Result<AgentEvent<Self::Session>, BackendError>>, BackendError>;
 }
