@@ -23,7 +23,9 @@ tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# `test-util` provides `#[tokio::test(start_paused = true)]`, which is what
+# makes the backend inactivity timeout branch testable without a real minute.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
 
 [lints.clippy]
 all = { level = "deny", priority = -1 }

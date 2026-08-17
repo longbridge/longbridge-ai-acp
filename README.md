@@ -45,6 +45,37 @@ Markdown fallback only. Tree and node/edge payloads whose `data` is an object
 also degrade to a readable Markdown outline or edge table instead of
 "Chart data is unavailable."
 
+## Turn outcomes
+
+ACP's `StopReason` is defined by the protocol schema and cannot distinguish a
+turn that failed from one that completed: a failed turn still ends with
+`StopReason::EndTurn` so that one bad turn never tears down the connection.
+Clients tell the two apart from an `_meta["longbridge.ai/event"]` envelope
+emitted at the point of failure:
+
+| `event` | `data` | Emitted when |
+| --- | --- | --- |
+| `backend_timeout` | `timeout_seconds`, `active_tools` | The backend stopped sending events for the inactivity timeout. |
+| `turn_failed` | `error_message`, `phase` | The turn failed. |
+
+`phase` says what to do with the transcript: `prompt` means the backend never
+took the turn and nothing of it was rendered, `stream` means part of an answer
+already rendered and the failure must be appended to it, and `prompt_response`
+(emitted client-side by `DesktopSession`) means the prompt request itself was
+answered with a JSON-RPC error.
+
+The envelope carries an empty text block, and the English sentence that follows
+it is tagged `longbridge.ai/standard-fallback` — clients that read the envelope
+should render their own localized message instead. The envelope means "this
+turn failed", not "no more content follows": in the `stream` phase the
+rich-text filter still flushes its buffered residue afterwards.
+
+The sentence emitted after a failed tool call carries the same tag, for the
+same reason: the `ToolCallUpdate` that precedes it already reports the failure
+with `status: failed`, the tool title, and the raw output. Every sentence this
+crate writes itself is tagged, so a client can render its own text for all of
+them and never show hard-coded English as model output.
+
 For an external subprocess agent, construct an `ExternalAgentConfig` and
 connect `ExternalAgent` to an `agent_client_protocol::Client`.
 
