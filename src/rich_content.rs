@@ -713,7 +713,7 @@ mod tests {
         let svg = chart.svg.unwrap();
         assert!(svg.contains("Vendor A"));
         assert!(svg.contains("Vendor B"));
-        assert!(svg.matches("fill-opacity=\".25\"").count() == 2);
+        assert_eq!(svg.matches("fill-opacity=\".25\"").count(), 2);
     }
 
     #[test]
