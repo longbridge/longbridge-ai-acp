@@ -5,6 +5,7 @@
 //! and authorization flow, then runs that backend in-process or over stdio.
 
 mod backend;
+mod chart_svg;
 mod client;
 mod desktop;
 mod rich_content;
