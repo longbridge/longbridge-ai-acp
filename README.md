@@ -36,6 +36,15 @@ Streaming normalization currently covers `vis-chart`, `html-live`,
 `[^N]`, and `[N]`. Active HTML is never executed by this crate; unsafe SVG is
 omitted instead of echoed as source markup.
 
+Every non-geographic `vis-chart` type ships a static SVG preview for generic
+ACP clients: column, bar, line, area, pie, scatter, histogram, funnel, radar,
+boxplot, treemap, word-cloud, sankey, heat-map, dual-axes, mind-map,
+organization-chart, indented-tree, fishbone-diagram, network-graph, and
+flow-diagram. Map charts (`pin-map`, `path-map`) and `vis-text` keep the
+Markdown fallback only. Tree and node/edge payloads whose `data` is an object
+also degrade to a readable Markdown outline or edge table instead of
+"Chart data is unavailable."
+
 For an external subprocess agent, construct an `ExternalAgentConfig` and
 connect `ExternalAgent` to an `agent_client_protocol::Client`.
 

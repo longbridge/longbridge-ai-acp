@@ -4,7 +4,6 @@ use agent_client_protocol::schema::v1::{
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::fmt::Write as _;
 use thiserror::Error;
 
 pub const RICH_CONTENT_NAMESPACE: &str = "longbridge.ai/rich-content";
@@ -108,7 +107,7 @@ impl RichContent {
         }
         object.insert("type".to_owned(), Value::String(chart_type));
         let fallback = chart_markdown_fallback(&data);
-        let svg = render_chart_svg(&data);
+        let svg = crate::chart_svg::render_chart_svg(&data);
         Ok(Self {
             version: RICH_CONTENT_VERSION,
             content_id,
@@ -379,6 +378,9 @@ pub(crate) fn chart_markdown_fallback(data: &Value) -> String {
     let title = data.get("title").and_then(Value::as_str);
     let rows = data.get("data").and_then(Value::as_array);
     let Some(rows) = rows.filter(|rows| !rows.is_empty()) else {
+        if let Some(fallback) = crate::chart_svg::chart_structured_fallback(data) {
+            return fallback;
+        }
         return title.map_or_else(
             || "Chart data is unavailable.".to_owned(),
             |title| format!("### {title}\n\nChart data is unavailable."),
@@ -396,6 +398,9 @@ pub(crate) fn chart_markdown_fallback(data: &Value) -> String {
         }
     }
     if columns.is_empty() {
+        if let Some(fallback) = crate::chart_svg::chart_structured_fallback(data) {
+            return fallback;
+        }
         return title.map_or_else(
             || "Chart contains non-tabular data.".to_owned(),
             |title| format!("### {title}\n\nChart contains non-tabular data."),
@@ -433,251 +438,6 @@ fn escape_markdown_cell(value: &str) -> String {
         .replace('\\', "\\\\")
         .replace('|', "\\|")
         .replace(['\r', '\n'], "<br>")
-}
-
-fn render_chart_svg(data: &Value) -> Option<String> {
-    let chart_type = data.get("type")?.as_str()?;
-    let items = data.get("data")?.as_array()?;
-    let points = chart_points(items);
-    if points.is_empty() {
-        return None;
-    }
-    if chart_type == "column" && has_multiple_groups(items) {
-        return Some(render_grouped_columns(data, items));
-    }
-    match chart_type {
-        "column" | "histogram" => Some(render_columns(data, &points)),
-        "bar" => Some(render_bars(data, &points)),
-        "line" | "area" | "scatter" => Some(render_plot(data, &points, chart_type)),
-        "pie" => Some(render_pie(data, &points)),
-        _ => None,
-    }
-}
-
-fn has_multiple_groups(items: &[Value]) -> bool {
-    let mut groups = Vec::new();
-    for group in items
-        .iter()
-        .filter_map(|item| item.get("group").and_then(value_label))
-    {
-        if !groups.contains(&group) {
-            groups.push(group);
-        }
-    }
-    groups.len() > 1
-}
-
-fn render_grouped_columns(data: &Value, items: &[Value]) -> String {
-    let mut categories = Vec::new();
-    let mut groups = Vec::new();
-    let mut values = Map::new();
-    let mut max = 1.0_f64;
-    for item in items {
-        let Some(category) = item.get("category").and_then(value_label) else {
-            continue;
-        };
-        let Some(group) = item.get("group").and_then(value_label) else {
-            continue;
-        };
-        let Some(value) = item.get("value").and_then(value_number) else {
-            continue;
-        };
-        if !categories.contains(&category) {
-            categories.push(category.clone());
-        }
-        if !groups.contains(&group) {
-            groups.push(group.clone());
-        }
-        max = max.max(value.abs());
-        values.insert(format!("{category}\0{group}"), Value::from(value));
-    }
-    let colors = ["#16a3a5", "#2563eb", "#f59e0b", "#ef4444", "#8b5cf6"];
-    let category_width = 600.0 / usize_as_f64(categories.len().max(1));
-    let bar_width = (category_width - 16.0) / usize_as_f64(groups.len().max(1));
-    let mut body = String::from(r#"<line class="grid" x1="60" y1="390" x2="680" y2="390"/>"#);
-    for (category_index, category) in categories.iter().enumerate() {
-        for (group_index, group) in groups.iter().enumerate() {
-            let value = values
-                .get(&format!("{category}\0{group}"))
-                .and_then(Value::as_f64)
-                .unwrap_or_default();
-            let height = value.abs() / max * 290.0;
-            let x = 70.0
-                + usize_as_f64(category_index) * category_width
-                + usize_as_f64(group_index) * bar_width;
-            let y = 390.0 - height;
-            write!(
-                body,
-                r#"<rect x="{x:.1}" y="{y:.1}" width="{:.1}" height="{height:.1}" fill="{}"/>"#,
-                (bar_width - 3.0).max(2.0),
-                colors[group_index % colors.len()]
-            )
-            .expect("writing to a String cannot fail");
-        }
-        let label_x = 70.0 + usize_as_f64(category_index) * category_width + category_width / 2.0;
-        write!(
-            body,
-            r#"<text x="{label_x:.1}" y="415" text-anchor="middle">{}</text>"#,
-            xml_escape(category)
-        )
-        .expect("writing to a String cannot fail");
-    }
-    for (index, group) in groups.iter().enumerate() {
-        write!(body, r#"<rect x="700" y="{}" width="12" height="12" fill="{}"/><text x="718" y="{}">{}</text>"#, 70 + index * 25, colors[index % colors.len()], 81 + index * 25, xml_escape(group)).expect("writing to a String cannot fail");
-    }
-    svg_shell(data, &body)
-}
-
-fn chart_points(items: &[Value]) -> Vec<(String, f64)> {
-    items
-        .iter()
-        .filter_map(|item| {
-            let object = item.as_object()?;
-            let label = ["category", "time", "x", "name", "label", "date"]
-                .iter()
-                .find_map(|key| object.get(*key).and_then(value_label))?;
-            let value = ["value", "y", "count"]
-                .iter()
-                .find_map(|key| object.get(*key).and_then(value_number))?;
-            value.is_finite().then_some((label, value))
-        })
-        .collect()
-}
-
-fn value_label(value: &Value) -> Option<String> {
-    match value {
-        Value::String(value) => Some(value.split_whitespace().collect::<Vec<_>>().join(" ")),
-        Value::Number(value) => Some(value.to_string()),
-        _ => None,
-    }
-}
-
-fn value_number(value: &Value) -> Option<f64> {
-    match value {
-        Value::Number(value) => value.as_f64(),
-        Value::String(value) => value.trim().parse().ok(),
-        _ => None,
-    }
-}
-
-fn svg_shell(data: &Value, body: &str) -> String {
-    let title = data
-        .get("title")
-        .and_then(Value::as_str)
-        .map(xml_escape)
-        .unwrap_or_default();
-    format!(
-        r#"<svg xmlns="http://www.w3.org/2000/svg" role="img" aria-label="{title}" viewBox="0 0 800 450"><style>text{{font:14px system-ui,sans-serif;fill:#334155}}.title{{font-size:20px;font-weight:600;fill:#0f172a}}.grid{{stroke:#e2e8f0}}.mark{{fill:#16a3a5}}.line{{fill:none;stroke:#16a3a5;stroke-width:3}}</style><text class="title" x="50" y="35">{title}</text>{body}</svg>"#
-    )
-}
-
-fn render_columns(data: &Value, points: &[(String, f64)]) -> String {
-    let max = points
-        .iter()
-        .map(|(_, value)| value.abs())
-        .fold(0.0, f64::max)
-        .max(1.0);
-    let width = 680.0 / usize_as_f64(points.len());
-    let mut body = String::from(r#"<line class="grid" x1="60" y1="390" x2="760" y2="390"/>"#);
-    for (index, (label, value)) in points.iter().enumerate() {
-        let height = value.abs() / max * 300.0;
-        let x = 70.0 + usize_as_f64(index) * width;
-        let y = 390.0 - height;
-        write!(body, r#"<rect class="mark" x="{x:.1}" y="{y:.1}" width="{:.1}" height="{height:.1}"/><text x="{:.1}" y="415" text-anchor="middle">{}</text>"#, (width - 12.0).max(2.0), x + (width - 12.0).max(2.0) / 2.0, xml_escape(label)).expect("writing to a String cannot fail");
-    }
-    svg_shell(data, &body)
-}
-
-fn render_bars(data: &Value, points: &[(String, f64)]) -> String {
-    let max = points
-        .iter()
-        .map(|(_, value)| value.abs())
-        .fold(0.0, f64::max)
-        .max(1.0);
-    let height = 330.0 / usize_as_f64(points.len());
-    let mut body = String::new();
-    for (index, (label, value)) in points.iter().enumerate() {
-        let width = value.abs() / max * 560.0;
-        let y = 60.0 + usize_as_f64(index) * height;
-        write!(body, r#"<text x="150" y="{:.1}" text-anchor="end">{}</text><rect class="mark" x="165" y="{y:.1}" width="{width:.1}" height="{:.1}"/>"#, y + height * 0.55, xml_escape(label), (height - 8.0).max(2.0)).expect("writing to a String cannot fail");
-    }
-    svg_shell(data, &body)
-}
-
-fn render_plot(data: &Value, points: &[(String, f64)], chart_type: &str) -> String {
-    let min = points
-        .iter()
-        .map(|(_, value)| *value)
-        .fold(f64::INFINITY, f64::min);
-    let max = points
-        .iter()
-        .map(|(_, value)| *value)
-        .fold(f64::NEG_INFINITY, f64::max);
-    let range = (max - min).max(1.0);
-    let step = 680.0 / usize_as_f64(points.len().saturating_sub(1).max(1));
-    let coordinates = points
-        .iter()
-        .enumerate()
-        .map(|(index, (_, value))| {
-            (
-                60.0 + usize_as_f64(index) * step,
-                390.0 - (*value - min) / range * 300.0,
-            )
-        })
-        .collect::<Vec<_>>();
-    let path = coordinates
-        .iter()
-        .enumerate()
-        .map(|(index, (x, y))| format!("{} {x:.1} {y:.1}", if index == 0 { "M" } else { "L" }))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let mut body = if chart_type == "area" {
-        format!(
-            r##"<path d="{path} L 740 390 L 60 390 Z" fill="#16a3a5" fill-opacity=".18"/><path class="line" d="{path}"/>"##
-        )
-    } else if chart_type == "line" {
-        format!(r#"<path class="line" d="{path}"/>"#)
-    } else {
-        String::new()
-    };
-    for (index, ((label, _), (x, y))) in points.iter().zip(&coordinates).enumerate() {
-        write!(body, r#"<circle class="mark" cx="{x:.1}" cy="{y:.1}" r="4"/><text x="{x:.1}" y="415" text-anchor="middle">{}</text>"#, if points.len() <= 10 || index % 2 == 0 { xml_escape(label) } else { String::new() }).expect("writing to a String cannot fail");
-    }
-    svg_shell(data, &body)
-}
-
-fn render_pie(data: &Value, points: &[(String, f64)]) -> String {
-    let total = points.iter().map(|(_, value)| value.max(0.0)).sum::<f64>();
-    if total <= 0.0 {
-        return svg_shell(data, "");
-    }
-    let colors = [
-        "#16a3a5", "#2563eb", "#f59e0b", "#ef4444", "#8b5cf6", "#64748b",
-    ];
-    let mut angle = -std::f64::consts::FRAC_PI_2;
-    let mut body = String::new();
-    for (index, (label, value)) in points.iter().enumerate() {
-        let next = angle + value.max(0.0) / total * std::f64::consts::TAU;
-        let (x1, y1) = (300.0 + 145.0 * angle.cos(), 235.0 + 145.0 * angle.sin());
-        let (x2, y2) = (300.0 + 145.0 * next.cos(), 235.0 + 145.0 * next.sin());
-        let large = i32::from(next - angle > std::f64::consts::PI);
-        write!(body, r#"<path d="M 300 235 L {x1:.1} {y1:.1} A 145 145 0 {large} 1 {x2:.1} {y2:.1} Z" fill="{}"/><rect x="510" y="{}" width="14" height="14" fill="{}"/><text x="532" y="{}">{}</text>"#, colors[index % colors.len()], 90 + index * 28, colors[index % colors.len()], 102 + index * 28, xml_escape(label)).expect("writing to a String cannot fail");
-        angle = next;
-    }
-    svg_shell(data, &body)
-}
-
-fn xml_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
-}
-
-fn usize_as_f64(value: usize) -> f64 {
-    f64::from(u32::try_from(value).unwrap_or(u32::MAX))
 }
 
 fn is_safe_svg(svg: &str) -> bool {
@@ -797,15 +557,175 @@ mod tests {
     }
 
     #[test]
-    fn non_cartesian_chart_keeps_json_and_has_no_misleading_preview() {
+    fn geo_chart_keeps_json_and_has_no_misleading_preview() {
+        let chart = RichContent::chart(
+            "chart-1",
+            json!({ "type": "pin-map", "data": [{ "longitude": 114.1, "latitude": 22.3 }] }),
+        )
+        .unwrap();
+        assert_eq!(chart.data["type"], "pin-map");
+        assert!(chart.svg.is_none());
+        assert!(chart.fallback.contains("longitude"));
+    }
+
+    #[test]
+    fn every_non_geo_chart_type_gets_an_svg_preview() {
+        let samples = [
+            json!({ "type": "column", "data": [{ "category": "Q1", "value": 1 }, { "category": "Q2", "value": 2 }] }),
+            json!({ "type": "bar", "data": [{ "category": "East", "value": 5 }] }),
+            json!({ "type": "line", "data": [{ "time": "Jan", "value": 3 }, { "time": "Feb", "value": 4 }] }),
+            json!({ "type": "area", "data": [{ "time": "Jan", "value": 3 }, { "time": "Feb", "value": 4 }] }),
+            json!({ "type": "pie", "data": [{ "category": "A", "value": 60 }, { "category": "B", "value": 40 }] }),
+            json!({ "type": "scatter", "data": [{ "x": 1, "y": 2 }, { "x": 3, "y": 5 }] }),
+            json!({ "type": "histogram", "data": [61, 62, 75, 75, 76, 88, 91, 95] }),
+            json!({ "type": "funnel", "data": [
+                { "category": "Visit", "value": 1000 },
+                { "category": "Inquiry", "value": 600 },
+                { "category": "Order", "value": 300 }
+            ] }),
+            json!({ "type": "radar", "data": [
+                { "name": "Speed", "value": 8 },
+                { "name": "Quality", "value": 9 },
+                { "name": "Cost", "value": 6 }
+            ] }),
+            json!({ "type": "boxplot", "data": [
+                { "category": "A", "value": 61 }, { "category": "A", "value": 70 },
+                { "category": "A", "value": 82 }, { "category": "B", "value": 55 },
+                { "category": "B", "value": 66 }, { "category": "B", "value": 74 }
+            ] }),
+            json!({ "type": "treemap", "data": [
+                { "name": "Electronics", "value": 500 },
+                { "name": "Appliances", "value": 300 },
+                { "name": "Apparel", "value": 200 }
+            ] }),
+            json!({ "type": "word-cloud", "data": [
+                { "text": "AI", "value": 50 }, { "text": "Cloud", "value": 30 }
+            ] }),
+            json!({ "type": "sankey", "data": [
+                { "source": "Revenue", "target": "Cost", "value": 600 },
+                { "source": "Revenue", "target": "Profit", "value": 400 }
+            ] }),
+            json!({ "type": "heat-map", "data": [
+                { "x": "Mon", "y": "AM", "value": 3 }, { "x": "Mon", "y": "PM", "value": 8 },
+                { "x": "Tue", "y": "AM", "value": 5 }, { "x": "Tue", "y": "PM", "value": 2 }
+            ] }),
+            json!({ "type": "dual-axes", "categories": ["2021", "2022"], "series": [
+                { "type": "column", "data": [91, 99], "axisYTitle": "Sales" },
+                { "type": "line", "data": [0.15, 0.22], "axisYTitle": "Margin" }
+            ], "data": [] }),
+            json!({ "type": "mind-map", "data": {
+                "name": "Project", "children": [
+                    { "name": "Plan", "children": [{ "name": "Scope" }] },
+                    { "name": "Build" }
+                ]
+            } }),
+            json!({ "type": "organization-chart", "data": {
+                "name": "CEO", "children": [{ "name": "CTO" }, { "name": "CFO" }]
+            } }),
+            json!({ "type": "indented-tree", "data": {
+                "name": "Docs", "children": [{ "name": "Guides" }]
+            } }),
+            json!({ "type": "fishbone-diagram", "data": {
+                "name": "Churn", "children": [{ "name": "Price" }, { "name": "Support" }]
+            } }),
+            json!({ "type": "network-graph", "data": {
+                "nodes": [{ "name": "A" }, { "name": "B" }, { "name": "C" }],
+                "edges": [{ "source": "A", "target": "B" }, { "source": "B", "target": "C" }]
+            } }),
+            json!({ "type": "flow-diagram", "data": {
+                "nodes": [{ "name": "Order" }, { "name": "Pay" }, { "name": "Ship" }],
+                "edges": [
+                    { "source": "Order", "target": "Pay", "name": "checkout" },
+                    { "source": "Pay", "target": "Ship" }
+                ]
+            } }),
+        ];
+        for sample in samples {
+            let chart_type = sample["type"].as_str().unwrap().to_owned();
+            let chart = RichContent::chart("chart-1", sample).unwrap();
+            let svg = chart
+                .svg
+                .as_deref()
+                .unwrap_or_else(|| panic!("{chart_type} should render an SVG preview"));
+            assert!(svg.starts_with("<svg"), "{chart_type} preview is SVG");
+            assert!(!svg.contains("<script"), "{chart_type} preview is passive");
+        }
+    }
+
+    #[test]
+    fn network_chart_with_edge_array_data_renders_and_lists_edges() {
         let chart = RichContent::chart(
             "chart-1",
             json!({ "type": "network", "data": [{ "source": "A", "target": "B" }] }),
         )
         .unwrap();
         assert_eq!(chart.data["type"], "network-graph");
-        assert!(chart.svg.is_none());
+        assert!(chart.svg.is_some());
         assert!(chart.fallback.contains("source"));
+    }
+
+    #[test]
+    fn tree_chart_fallback_is_a_nested_list_not_unavailable() {
+        let chart = RichContent::chart(
+            "chart-1",
+            json!({ "type": "mind-map", "title": "Plan", "data": {
+                "name": "Root", "children": [{ "name": "Leaf" }]
+            } }),
+        )
+        .unwrap();
+        assert!(chart.fallback.contains("### Plan"));
+        assert!(chart.fallback.contains("- Root"));
+        assert!(chart.fallback.contains("  - Leaf"));
+        assert!(!chart.fallback.contains("unavailable"));
+    }
+
+    #[test]
+    fn dual_axes_fallback_tabulates_categories_and_series() {
+        let chart = RichContent::chart(
+            "chart-1",
+            json!({ "type": "dual-axes", "categories": ["2021", "2022"], "series": [
+                { "type": "column", "data": [91, 99], "axisYTitle": "Sales" },
+                { "type": "line", "data": [0.15, 0.22], "axisYTitle": "Margin" }
+            ] }),
+        )
+        .unwrap();
+        assert!(chart.fallback.contains("| Category | Sales | Margin |"));
+        assert!(chart.fallback.contains("| 2021 | 91 | 0.15 |"));
+        let svg = chart.svg.unwrap();
+        assert!(svg.contains("<rect"));
+        assert!(svg.contains("<path"));
+    }
+
+    #[test]
+    fn radar_with_groups_draws_one_polygon_per_series() {
+        let chart = RichContent::chart(
+            "chart-1",
+            json!({ "type": "radar", "data": [
+                { "name": "Speed", "value": 8, "group": "Vendor A" },
+                { "name": "Quality", "value": 9, "group": "Vendor A" },
+                { "name": "Cost", "value": 6, "group": "Vendor A" },
+                { "name": "Speed", "value": 5, "group": "Vendor B" },
+                { "name": "Quality", "value": 7, "group": "Vendor B" },
+                { "name": "Cost", "value": 9, "group": "Vendor B" }
+            ] }),
+        )
+        .unwrap();
+        let svg = chart.svg.unwrap();
+        assert!(svg.contains("Vendor A"));
+        assert!(svg.contains("Vendor B"));
+        assert!(svg.matches("fill-opacity=\".25\"").count() == 2);
+    }
+
+    #[test]
+    fn histogram_bins_raw_numeric_samples() {
+        let chart = RichContent::chart(
+            "chart-1",
+            json!({ "type": "histogram", "data": [60, 61, 62, 75, 76, 77, 90, 95] }),
+        )
+        .unwrap();
+        let svg = chart.svg.unwrap();
+        assert!(svg.contains("rect class=\"mark\""));
+        assert!(svg.contains("\u{2013}"), "bin labels show ranges");
     }
 
     #[test]
