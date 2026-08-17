@@ -494,15 +494,67 @@ pub fn acp_agent_with_auth_methods<B: AgentBackend>(
                 connection.spawn(async move {
                     let result: agent_client_protocol::Result<PromptResponse> = async {
                     let (cwd, state, mut cancelled) = {
-                        let sessions = prompt_sessions.read().await;
-                        let record = sessions
-                            .get(&request.session_id)
-                            .ok_or_else(agent_client_protocol::Error::invalid_params)?;
-                        (
-                            record.cwd.clone(),
-                            record.state.clone(),
-                            record.cancel.subscribe(),
-                        )
+                        // Fast path: a session already opened this run (session/new
+                        // or session/load).
+                        let existing = {
+                            let sessions = prompt_sessions.read().await;
+                            sessions.get(&request.session_id).map(|record| {
+                                (
+                                    record.cwd.clone(),
+                                    record.state.clone(),
+                                    record.cancel.subscribe(),
+                                )
+                            })
+                        };
+                        match existing {
+                            Some(found) => found,
+                            // A history backend can be prompted straight from a
+                            // session/list entry: a client (e.g. ACP Inspector) that
+                            // selects a listed session without an explicit
+                            // session/load would otherwise hit a bare "Invalid
+                            // params". Open it lazily instead. The history is already
+                            // the client's to show, so only the state is kept — the
+                            // replay stream is dropped rather than re-sent.
+                            None if B::SESSION_HISTORY => {
+                                let cwd = std::env::current_dir()
+                                    .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                                let loaded = backend
+                                    .load_session(request.session_id.0.as_ref(), &cwd)
+                                    .await
+                                    .map_err(|error| {
+                                        agent_client_protocol::Error::invalid_params().data(
+                                            format!(
+                                                "cannot open session {:?}: {error}",
+                                                request.session_id.0
+                                            ),
+                                        )
+                                    })?;
+                                let mut sessions = prompt_sessions.write().await;
+                                let record = sessions
+                                    .entry(request.session_id.clone())
+                                    .or_insert_with(|| SessionRecord {
+                                        cwd,
+                                        state: loaded.state,
+                                        cancel: tokio::sync::watch::channel(0).0,
+                                    });
+                                (
+                                    record.cwd.clone(),
+                                    record.state.clone(),
+                                    record.cancel.subscribe(),
+                                )
+                            }
+                            // No history to fall back on: a prompt must be preceded
+                            // by session/new. Say so rather than "Invalid params".
+                            None => {
+                                return Err(agent_client_protocol::Error::invalid_params().data(
+                                    format!(
+                                        "unknown session id {:?}; call session/new first and use \
+                                         the sessionId it returns",
+                                        request.session_id.0
+                                    ),
+                                ));
+                            }
+                        }
                     };
                     let mut events = match backend.prompt(state, prompt, &cwd).await {
                         Ok(events) => events,
@@ -1805,6 +1857,10 @@ mod tests {
 
     struct HistoryBackend;
 
+    /// A history backend whose `load_session` ignores cwd, so a prompt-time lazy
+    /// load (which has no client cwd) can open a listed session.
+    struct LazyBackend;
+
     #[test]
     fn failed_tool_message_prefers_structured_error_detail() {
         assert_eq!(
@@ -2279,6 +2335,39 @@ mod tests {
     }
 
     #[async_trait]
+    impl AgentBackend for LazyBackend {
+        type Session = TestSession;
+
+        const SESSION_HISTORY: bool = true;
+
+        async fn load_session(
+            &self,
+            session_id: &str,
+            _cwd: &Path,
+        ) -> Result<crate::LoadedAgentSession<Self::Session>, BackendError> {
+            Ok(crate::LoadedAgentSession {
+                state: TestSession {
+                    conversation_id: Some(session_id.to_string()),
+                },
+                history: Box::pin(stream::empty()),
+            })
+        }
+
+        async fn prompt(
+            &self,
+            session: TestSession,
+            prompt: String,
+            _cwd: &Path,
+        ) -> Result<BoxStream<'static, Result<AgentEvent<TestSession>, BackendError>>, BackendError>
+        {
+            Ok(Box::pin(stream::iter([Ok(AgentEvent::Text(format!(
+                "continued {}: {prompt}",
+                session.conversation_id.unwrap_or_default()
+            )))])))
+        }
+    }
+
+    #[async_trait]
     impl AgentBackend for RichBackend {
         type Session = ();
 
@@ -2627,6 +2716,52 @@ mod tests {
             updates.get(3),
             Some(SessionUpdate::AgentMessageChunk(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn a_listed_session_can_be_prompted_without_an_explicit_load() {
+        // A history backend should let a session that only session/list knows about
+        // be prompted straight away — the client (e.g. ACP Inspector) may select it
+        // without a separate session/load. Before the lazy-load this returned
+        // -32602 "Invalid params".
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let received = Arc::clone(&updates);
+        let client = agent_client_protocol::Client
+            .builder()
+            .on_receive_notification(
+                async move |notification: SessionNotification, _cx| {
+                    received.lock().expect("mutex").push(notification.update);
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_notification!(),
+            );
+
+        let response = client
+            .connect_with(acp_agent(LazyBackend), async |connection| {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                // No session/new, no session/load — straight to a prompt.
+                connection
+                    .send_request(PromptRequest::new(
+                        "chat-unopened",
+                        vec![ContentBlock::Text(TextContent::new("hi"))],
+                    ))
+                    .block_task()
+                    .await
+            })
+            .await
+            .expect("a listed session is prompted without an explicit load");
+
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+        let updates = updates.lock().expect("mutex");
+        assert!(
+            updates
+                .iter()
+                .any(|u| matches!(u, SessionUpdate::AgentMessageChunk(_))),
+            "the lazily-opened session produced an answer"
+        );
     }
 
     #[tokio::test]
