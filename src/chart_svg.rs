@@ -318,6 +318,32 @@ fn value_number(value: &Value) -> Option<f64> {
     }
 }
 
+/// Unique-per-chart gradient id prefix. Inline SVGs share one id namespace
+/// when several previews land on the same page, so ids derive from the
+/// chart's own title/type rather than a fixed name.
+fn gradient_prefix(data: &Value) -> String {
+    let seed = format!(
+        "{}{}",
+        data.get("type").and_then(Value::as_str).unwrap_or("chart"),
+        data.get("title")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    );
+    let mut hash = 5381_u32;
+    for byte in seed.bytes() {
+        hash = hash.wrapping_mul(33) ^ u32::from(byte);
+    }
+    format!("lbg{hash:08x}")
+}
+
+/// A vertical fade from the series colour to transparent — the web
+/// renderer's area fill.
+fn area_gradient(id: &str, color: &str) -> String {
+    format!(
+        r#"<linearGradient id="{id}" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="{color}" stop-opacity=".45"/><stop offset="100%" stop-color="{color}" stop-opacity=".04"/></linearGradient>"#
+    )
+}
+
 fn svg_shell(data: &Value, body: &str) -> String {
     let title = data
         .get("title")
@@ -392,8 +418,10 @@ fn render_plot(data: &Value, points: &[(String, f64)], chart_type: &str) -> Stri
         .collect::<Vec<_>>()
         .join(" ");
     let mut body = if chart_type == "area" {
+        let gradient = gradient_prefix(data);
         format!(
-            r##"<path d="{path} L 740 390 L 60 390 Z" fill="#00b7b7" fill-opacity=".18"/><path class="line" d="{path}"/>"##
+            r#"<defs>{}</defs><path d="{path} L 740 390 L 60 390 Z" fill="url(#{gradient})"/><path class="line" d="{path}"/>"#,
+            area_gradient(&gradient, "#00b7b7")
         )
     } else if chart_type == "line" {
         format!(r#"<path class="line" d="{path}"/>"#)
@@ -460,6 +488,18 @@ fn render_multi_plot(data: &Value, items: &[Value], chart_type: &str) -> Option<
         )
     };
     let mut body = String::new();
+    let gradient_base = gradient_prefix(data);
+    if chart_type == "area" {
+        body.push_str("<defs>");
+        for group_index in 0..groups.len() {
+            let color = SERIES_COLORS[group_index % SERIES_COLORS.len()];
+            body.push_str(&area_gradient(
+                &format!("{gradient_base}-{group_index}"),
+                color,
+            ));
+        }
+        body.push_str("</defs>");
+    }
     for (group_index, (group, series)) in groups.iter().enumerate() {
         let color = SERIES_COLORS[group_index % SERIES_COLORS.len()];
         let mut ordered = series.clone();
@@ -478,7 +518,7 @@ fn render_multi_plot(data: &Value, items: &[Value], chart_type: &str) -> Option<
             let (last_x, _) = scale(ordered.last()?.0, 0.0);
             write!(
                 body,
-                r#"<path d="{path} L {last_x:.1} 390 L {first_x:.1} 390 Z" fill="{color}" fill-opacity=".18"/>"#
+                r#"<path d="{path} L {last_x:.1} 390 L {first_x:.1} 390 Z" fill="url(#{gradient_base}-{group_index})"/>"#
             )
             .expect("writing to a String cannot fail");
         }

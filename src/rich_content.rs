@@ -763,6 +763,43 @@ mod tests {
     }
 
     #[test]
+    fn area_fills_use_a_gradient_with_chart_unique_ids() {
+        let single = RichContent::chart(
+            "chart-1",
+            json!({ "type": "area", "title": "Revenue", "data": [
+                { "category": "Q1", "value": 10 }, { "category": "Q2", "value": 14 }
+            ] }),
+        )
+        .unwrap()
+        .svg
+        .unwrap();
+        assert!(single.contains("<linearGradient id=\"lbg"));
+        assert!(single.contains("stop-opacity=\".45\""));
+
+        let multi = RichContent::chart(
+            "chart-1",
+            json!({ "type": "area", "title": "AQI", "data": [
+                { "category": "2021", "value": 100, "group": "北京" },
+                { "category": "2022", "value": 95, "group": "北京" },
+                { "category": "2021", "value": 80, "group": "上海" },
+                { "category": "2022", "value": 78, "group": "上海" }
+            ] }),
+        )
+        .unwrap()
+        .svg
+        .unwrap();
+        // one gradient per series, referenced by fill
+        assert_eq!(multi.matches("<linearGradient").count(), 2);
+        assert_eq!(multi.matches("fill=\"url(#").count(), 2);
+        // ids differ between charts with different titles (inline-SVG safety)
+        let id = |svg: &str| {
+            let start = svg.find("id=\"lbg").unwrap() + 4;
+            svg[start..start + 11].to_string()
+        };
+        assert_ne!(id(&single), id(&multi));
+    }
+
+    #[test]
     fn sankey_nodes_cycle_through_the_palette() {
         let chart = RichContent::chart(
             "chart-1",
