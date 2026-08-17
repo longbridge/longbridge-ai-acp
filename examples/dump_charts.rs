@@ -5,6 +5,18 @@ use serde_json::json;
 fn main() {
     let out = std::env::args().nth(1).expect("output dir");
     let samples = [
+        json!({ "type": "column", "stack": true, "title": "Stacked revenue", "data": [
+            { "category": "2022", "value": 320, "group": "Hardware" }, { "category": "2022", "value": 180, "group": "Software" }, { "category": "2022", "value": 90, "group": "Services" },
+            { "category": "2023", "value": 350, "group": "Hardware" }, { "category": "2023", "value": 220, "group": "Software" }, { "category": "2023", "value": 130, "group": "Services" } ] }),
+        json!({ "type": "area", "title": "AQI by city", "data": [
+            { "category": "2019", "value": 150, "group": "Beijing" }, { "category": "2020", "value": 160, "group": "Beijing" }, { "category": "2021", "value": 145, "group": "Beijing" },
+            { "category": "2019", "value": 100, "group": "Shanghai" }, { "category": "2020", "value": 95, "group": "Shanghai" }, { "category": "2021", "value": 85, "group": "Shanghai" },
+            { "category": "2019", "value": 90, "group": "Guangzhou" }, { "category": "2020", "value": 88, "group": "Guangzhou" }, { "category": "2021", "value": 80, "group": "Guangzhou" } ] }),
+        json!({ "type": "fishbone-diagram", "title": "Price drop drivers", "data": { "name": "Price drop", "children": [
+            { "name": "Market", "children": [{ "name": "Liquidity" }, { "name": "Position unwind" }] },
+            { "name": "Valuation", "children": [{ "name": "Rates up" }] },
+            { "name": "Policy", "children": [{ "name": "Antitrust" }] },
+            { "name": "Earnings", "children": [{ "name": "Revenue miss" }] } ] } }),
         json!({ "type": "funnel", "title": "Sales funnel", "data": [
             { "category": "Visit", "value": 1000 }, { "category": "Inquiry", "value": 600 },
             { "category": "Order", "value": 300 }, { "category": "Deal", "value": 150 } ] }),
@@ -78,7 +90,20 @@ fn main() {
             { "category": "Tablet", "value": 15 }, { "category": "Other", "value": 15 } ] }),
     ];
     for sample in samples {
-        let name = sample["type"].as_str().unwrap().to_owned();
+        let mut name = sample["type"].as_str().unwrap().to_owned();
+        if let Some(title) = sample["title"].as_str() {
+            let slug: String = title
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() {
+                        c.to_ascii_lowercase()
+                    } else {
+                        '-'
+                    }
+                })
+                .collect();
+            name = format!("{name}-{slug}");
+        }
         let chart = RichContent::chart("preview", sample).expect("chart accepted");
         let svg = chart.svg.expect("svg rendered");
         std::fs::write(format!("{out}/{name}.svg"), svg).unwrap();

@@ -717,6 +717,86 @@ mod tests {
     }
 
     #[test]
+    fn multi_series_line_draws_one_stroke_per_group() {
+        let chart = RichContent::chart(
+            "chart-1",
+            json!({ "type": "line", "data": [
+                { "category": "2021", "value": 150, "group": "北京" },
+                { "category": "2022", "value": 155, "group": "北京" },
+                { "category": "2021", "value": 100, "group": "上海" },
+                { "category": "2022", "value": 90, "group": "上海" }
+            ] }),
+        )
+        .unwrap();
+        let svg = chart.svg.unwrap();
+        assert!(svg.contains("北京"));
+        assert!(svg.contains("上海"));
+        // one coloured polyline per series, not a single concatenated line
+        assert_eq!(svg.matches("stroke-width=\"3\"").count(), 2);
+        assert!(svg.contains("#00b7b7"));
+        assert!(svg.contains("#7fe5bc"));
+    }
+
+    #[test]
+    fn stacked_columns_pile_groups_instead_of_side_by_side() {
+        let chart = RichContent::chart(
+            "chart-1",
+            json!({ "type": "column", "stack": true, "data": [
+                { "category": "2023", "value": 350, "group": "硬件" },
+                { "category": "2023", "value": 220, "group": "软件" },
+                { "category": "2024", "value": 380, "group": "硬件" },
+                { "category": "2024", "value": 290, "group": "软件" }
+            ] }),
+        )
+        .unwrap();
+        let svg = chart.svg.unwrap();
+        // 2 categories x 2 segments + 2 legend swatches = 6 rects
+        assert_eq!(svg.matches("<rect").count(), 6);
+        // stacked: both segments of a category share the same x
+        let mut xs: Vec<&str> = svg
+            .match_indices("<rect x=\"")
+            .map(|(i, _)| &svg[i + 9..i + 14])
+            .collect();
+        xs.sort_unstable();
+        xs.dedup();
+        assert!(xs.len() <= 3, "expected shared x per category, got {xs:?}");
+    }
+
+    #[test]
+    fn sankey_nodes_cycle_through_the_palette() {
+        let chart = RichContent::chart(
+            "chart-1",
+            json!({ "type": "sankey", "data": [
+                { "source": "营收", "target": "硬件", "value": 60 },
+                { "source": "营收", "target": "软件", "value": 40 },
+                { "source": "硬件", "target": "毛利", "value": 30 }
+            ] }),
+        )
+        .unwrap();
+        let svg = chart.svg.unwrap();
+        assert!(svg.contains("#00b7b7"));
+        assert!(svg.contains("#7fe5bc"));
+        assert!(svg.contains("#ffc700"));
+        // links are neutral gray, matching the web renderer
+        assert!(svg.contains("stroke=\"#94a3b8\""));
+    }
+
+    #[test]
+    fn tree_branches_take_distinct_palette_colors() {
+        let chart = RichContent::chart(
+            "chart-1",
+            json!({ "type": "fishbone-diagram", "data": { "name": "股价下跌", "children": [
+                { "name": "市场因素", "children": [{ "name": "流动性收紧" }] },
+                { "name": "估值因素", "children": [{ "name": "利率上行" }] }
+            ] } }),
+        )
+        .unwrap();
+        let svg = chart.svg.unwrap();
+        assert!(svg.contains("fill=\"#00b7b7\""));
+        assert!(svg.contains("fill=\"#7fe5bc\""));
+    }
+
+    #[test]
     fn histogram_bins_raw_numeric_samples() {
         let chart = RichContent::chart(
             "chart-1",
@@ -725,7 +805,7 @@ mod tests {
         .unwrap();
         let svg = chart.svg.unwrap();
         // Bars are now coloured per-index from the palette, not the flat teal mark.
-        assert!(svg.contains("<rect fill=\"#16a3a5\""));
+        assert!(svg.contains("<rect fill=\"#00b7b7\""));
         assert!(svg.contains("\u{2013}"), "bin labels show ranges");
     }
 
