@@ -9,10 +9,10 @@ use serde_json::{Map, Value};
 use std::fmt::Write as _;
 
 const SERIES_COLORS: &[&str] = &[
-    "#16a3a5", "#2563eb", "#f59e0b", "#ef4444", "#8b5cf6", "#64748b",
+    "#00b7b7", "#7fe5bc", "#ffc700", "#ff716e", "#fb6ebc", "#de3250", "#805cff",
 ];
 const HEAT_SHADES: &[&str] = &[
-    "#e6f7f7", "#c0e9e9", "#8ad4d5", "#54bfc0", "#2bb0b2", "#16a3a5",
+    "#e5f8f8", "#bfefef", "#8ce3e3", "#55d3d3", "#22c2c2", "#00b7b7",
 ];
 const MAX_TREE_DEPTH: usize = 6;
 const MAX_TREE_LEAVES: usize = 24;
@@ -43,7 +43,13 @@ pub(crate) fn render_chart_svg(data: &Value) -> Option<String> {
         "radar" => render_radar(data, items),
         _ => {
             if chart_type == "column" && has_multiple_groups(items) {
+                if data.get("stack").and_then(Value::as_bool) == Some(true) {
+                    return Some(render_stacked_columns(data, items));
+                }
                 return Some(render_grouped_columns(data, items));
+            }
+            if matches!(chart_type, "line" | "area") && has_multiple_groups(items) {
+                return render_multi_plot(data, items, chart_type);
             }
             let points = chart_points(items);
             if points.is_empty() {
@@ -206,6 +212,80 @@ fn render_grouped_columns(data: &Value, items: &[Value]) -> String {
     svg_shell(data, &body)
 }
 
+/// Stacked columns (the payload sets `stack: true`): the groups of each
+/// category are piled bottom-up and scaled by the tallest stack, matching the
+/// web renderer instead of drawing them side by side.
+fn render_stacked_columns(data: &Value, items: &[Value]) -> String {
+    let mut categories = Vec::new();
+    let mut groups = Vec::new();
+    let mut values = Map::new();
+    for item in items {
+        let Some(category) = item.get("category").and_then(value_label) else {
+            continue;
+        };
+        let Some(group) = item.get("group").and_then(value_label) else {
+            continue;
+        };
+        let Some(value) = item.get("value").and_then(value_number) else {
+            continue;
+        };
+        if !categories.contains(&category) {
+            categories.push(category.clone());
+        }
+        if !groups.contains(&group) {
+            groups.push(group.clone());
+        }
+        values.insert(format!("{category}\0{group}"), Value::from(value.max(0.0)));
+    }
+    let mut max_total = 1.0_f64;
+    for category in &categories {
+        let total: f64 = groups
+            .iter()
+            .filter_map(|group| {
+                values
+                    .get(&format!("{category}\0{group}"))
+                    .and_then(Value::as_f64)
+            })
+            .sum();
+        max_total = max_total.max(total);
+    }
+    let category_width = 600.0 / usize_as_f64(categories.len().max(1));
+    let bar_width = (category_width - 24.0).max(6.0);
+    let mut body = String::from(r#"<line class="grid" x1="60" y1="390" x2="680" y2="390"/>"#);
+    for (category_index, category) in categories.iter().enumerate() {
+        let x = 70.0 + usize_as_f64(category_index) * category_width;
+        let mut y = 390.0_f64;
+        for (group_index, group) in groups.iter().enumerate() {
+            let value = values
+                .get(&format!("{category}\0{group}"))
+                .and_then(Value::as_f64)
+                .unwrap_or_default();
+            let height = value / max_total * 290.0;
+            if height <= 0.0 {
+                continue;
+            }
+            y -= height;
+            write!(
+                body,
+                r#"<rect x="{x:.1}" y="{y:.1}" width="{bar_width:.1}" height="{height:.1}" fill="{}"/>"#,
+                SERIES_COLORS[group_index % SERIES_COLORS.len()]
+            )
+            .expect("writing to a String cannot fail");
+        }
+        write!(
+            body,
+            r#"<text x="{:.1}" y="415" text-anchor="middle">{}</text>"#,
+            x + bar_width / 2.0,
+            xml_escape(category)
+        )
+        .expect("writing to a String cannot fail");
+    }
+    for (index, group) in groups.iter().enumerate() {
+        write!(body, r#"<rect x="700" y="{}" width="12" height="12" fill="{}"/><text x="718" y="{}">{}</text>"#, 70 + index * 25, SERIES_COLORS[index % SERIES_COLORS.len()], 81 + index * 25, xml_escape(group)).expect("writing to a String cannot fail");
+    }
+    svg_shell(data, &body)
+}
+
 fn chart_points(items: &[Value]) -> Vec<(String, f64)> {
     items
         .iter()
@@ -238,6 +318,32 @@ fn value_number(value: &Value) -> Option<f64> {
     }
 }
 
+/// Unique-per-chart gradient id prefix. Inline SVGs share one id namespace
+/// when several previews land on the same page, so ids derive from the
+/// chart's own title/type rather than a fixed name.
+fn gradient_prefix(data: &Value) -> String {
+    let seed = format!(
+        "{}{}",
+        data.get("type").and_then(Value::as_str).unwrap_or("chart"),
+        data.get("title")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    );
+    let mut hash = 5381_u32;
+    for byte in seed.bytes() {
+        hash = hash.wrapping_mul(33) ^ u32::from(byte);
+    }
+    format!("lbg{hash:08x}")
+}
+
+/// A vertical fade from the series colour to transparent — the web
+/// renderer's area fill.
+fn area_gradient(id: &str, color: &str) -> String {
+    format!(
+        r#"<linearGradient id="{id}" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="{color}" stop-opacity=".45"/><stop offset="100%" stop-color="{color}" stop-opacity=".04"/></linearGradient>"#
+    )
+}
+
 fn svg_shell(data: &Value, body: &str) -> String {
     let title = data
         .get("title")
@@ -245,7 +351,7 @@ fn svg_shell(data: &Value, body: &str) -> String {
         .map(xml_escape)
         .unwrap_or_default();
     format!(
-        r#"<svg xmlns="http://www.w3.org/2000/svg" role="img" aria-label="{title}" viewBox="0 0 800 450"><style>text{{font:14px system-ui,sans-serif;fill:#334155}}.title{{font-size:20px;font-weight:600;fill:#0f172a}}.grid{{stroke:#e2e8f0}}.mark{{fill:#16a3a5}}.line{{fill:none;stroke:#16a3a5;stroke-width:3}}.edge{{stroke:#94a3b8;stroke-width:1.5;fill:none}}.node{{fill:#e0f2f2;stroke:#16a3a5;stroke-width:1.5}}</style><text class="title" x="50" y="35">{title}</text>{body}</svg>"#
+        r#"<svg xmlns="http://www.w3.org/2000/svg" role="img" aria-label="{title}" viewBox="0 0 800 450"><style>text{{font:14px system-ui,sans-serif;fill:#334155}}.title{{font-size:20px;font-weight:600;fill:#0f172a}}.grid{{stroke:#e2e8f0}}.mark{{fill:#00b7b7}}.line{{fill:none;stroke:#00b7b7;stroke-width:3}}.edge{{stroke:#94a3b8;stroke-width:1.5;fill:none}}.node{{fill:#e0f2f2;stroke:#00b7b7;stroke-width:1.5}}</style><text class="title" x="50" y="35">{title}</text>{body}</svg>"#
     )
 }
 
@@ -312,8 +418,10 @@ fn render_plot(data: &Value, points: &[(String, f64)], chart_type: &str) -> Stri
         .collect::<Vec<_>>()
         .join(" ");
     let mut body = if chart_type == "area" {
+        let gradient = gradient_prefix(data);
         format!(
-            r##"<path d="{path} L 740 390 L 60 390 Z" fill="#16a3a5" fill-opacity=".18"/><path class="line" d="{path}"/>"##
+            r#"<defs>{}</defs><path d="{path} L 740 390 L 60 390 Z" fill="url(#{gradient})"/><path class="line" d="{path}"/>"#,
+            area_gradient(&gradient, "#00b7b7")
         )
     } else if chart_type == "line" {
         format!(r#"<path class="line" d="{path}"/>"#)
@@ -324,6 +432,123 @@ fn render_plot(data: &Value, points: &[(String, f64)], chart_type: &str) -> Stri
         write!(body, r#"<circle class="mark" cx="{x:.1}" cy="{y:.1}" r="4"/><text x="{x:.1}" y="415" text-anchor="middle">{}</text>"#, if points.len() <= 10 || index % 2 == 0 { xml_escape(label) } else { String::new() }).expect("writing to a String cannot fail");
     }
     svg_shell(data, &body)
+}
+
+/// Multi-series line/area: one polyline (or translucent area) per group,
+/// coloured from the shared palette, with a legend. Without this, grouped
+/// series were concatenated into a single zig-zag line.
+fn render_multi_plot(data: &Value, items: &[Value], chart_type: &str) -> Option<String> {
+    let mut categories: Vec<String> = Vec::new();
+    let mut groups: Vec<(String, Vec<(usize, f64)>)> = Vec::new();
+    for item in items {
+        let Some(group) = item.get("group").and_then(value_label) else {
+            continue;
+        };
+        let Some(label) = ["category", "x", "name", "label", "time"]
+            .iter()
+            .find_map(|key| item.get(*key).and_then(value_label))
+        else {
+            continue;
+        };
+        let Some(value) = ["value", "y"]
+            .iter()
+            .find_map(|key| item.get(*key).and_then(value_number))
+        else {
+            continue;
+        };
+        let column = categories
+            .iter()
+            .position(|existing| *existing == label)
+            .unwrap_or_else(|| {
+                categories.push(label);
+                categories.len() - 1
+            });
+        if let Some((_, series)) = groups.iter_mut().find(|(name, _)| *name == group) {
+            series.push((column, value));
+        } else {
+            groups.push((group, vec![(column, value)]));
+        }
+    }
+    if categories.is_empty() || groups.is_empty() {
+        return None;
+    }
+    let (mut min, mut max) = (f64::INFINITY, f64::NEG_INFINITY);
+    for (_, series) in &groups {
+        for (_, value) in series {
+            min = min.min(*value);
+            max = max.max(*value);
+        }
+    }
+    let range = (max - min).max(1.0);
+    let step = 640.0 / usize_as_f64(categories.len().saturating_sub(1).max(1));
+    let scale = |column: usize, value: f64| {
+        (
+            60.0 + usize_as_f64(column) * step,
+            390.0 - (value - min) / range * 300.0,
+        )
+    };
+    let mut body = String::new();
+    let gradient_base = gradient_prefix(data);
+    if chart_type == "area" {
+        body.push_str("<defs>");
+        for group_index in 0..groups.len() {
+            let color = SERIES_COLORS[group_index % SERIES_COLORS.len()];
+            body.push_str(&area_gradient(
+                &format!("{gradient_base}-{group_index}"),
+                color,
+            ));
+        }
+        body.push_str("</defs>");
+    }
+    for (group_index, (group, series)) in groups.iter().enumerate() {
+        let color = SERIES_COLORS[group_index % SERIES_COLORS.len()];
+        let mut ordered = series.clone();
+        ordered.sort_by_key(|(column, _)| *column);
+        let path = ordered
+            .iter()
+            .enumerate()
+            .map(|(index, (column, value))| {
+                let (x, y) = scale(*column, *value);
+                format!("{} {x:.1} {y:.1}", if index == 0 { "M" } else { "L" })
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        if chart_type == "area" {
+            let (first_x, _) = scale(ordered.first()?.0, 0.0);
+            let (last_x, _) = scale(ordered.last()?.0, 0.0);
+            write!(
+                body,
+                r#"<path d="{path} L {last_x:.1} 390 L {first_x:.1} 390 Z" fill="url(#{gradient_base}-{group_index})"/>"#
+            )
+            .expect("writing to a String cannot fail");
+        }
+        write!(
+            body,
+            r#"<path d="{path}" fill="none" stroke="{color}" stroke-width="3"/>"#
+        )
+        .expect("writing to a String cannot fail");
+        for (column, value) in &ordered {
+            let (x, y) = scale(*column, *value);
+            write!(
+                body,
+                r#"<circle cx="{x:.1}" cy="{y:.1}" r="4" fill="{color}"/>"#
+            )
+            .expect("writing to a String cannot fail");
+        }
+        write!(body, r#"<rect x="700" y="{}" width="12" height="12" fill="{color}"/><text x="718" y="{}">{}</text>"#, 70 + group_index * 25, 81 + group_index * 25, xml_escape(group)).expect("writing to a String cannot fail");
+    }
+    for (column, label) in categories.iter().enumerate() {
+        if categories.len() <= 10 || column % 2 == 0 {
+            let (x, _) = scale(column, min);
+            write!(
+                body,
+                r#"<text x="{x:.1}" y="415" text-anchor="middle">{}</text>"#,
+                xml_escape(label)
+            )
+            .expect("writing to a String cannot fail");
+        }
+    }
+    Some(svg_shell(data, &body))
 }
 
 fn render_pie(data: &Value, points: &[(String, f64)]) -> String {
@@ -703,7 +928,7 @@ fn render_boxplot(data: &Value, items: &[Value]) -> Option<String> {
         let half = (slot * 0.18).clamp(12.0, 45.0);
         write!(
             body,
-            r##"<line class="edge" x1="{center:.1}" y1="{:.1}" x2="{center:.1}" y2="{:.1}"/><line class="edge" x1="{:.1}" y1="{:.1}" x2="{:.1}" y2="{:.1}"/><line class="edge" x1="{:.1}" y1="{:.1}" x2="{:.1}" y2="{:.1}"/><rect class="node" x="{:.1}" y="{:.1}" width="{:.1}" height="{:.1}"/><line x1="{:.1}" y1="{:.1}" x2="{:.1}" y2="{:.1}" stroke="#16a3a5" stroke-width="2.5"/><text x="{center:.1}" y="415" text-anchor="middle">{}</text>"##,
+            r##"<line class="edge" x1="{center:.1}" y1="{:.1}" x2="{center:.1}" y2="{:.1}"/><line class="edge" x1="{:.1}" y1="{:.1}" x2="{:.1}" y2="{:.1}"/><line class="edge" x1="{:.1}" y1="{:.1}" x2="{:.1}" y2="{:.1}"/><rect class="node" x="{:.1}" y="{:.1}" width="{:.1}" height="{:.1}"/><line x1="{:.1}" y1="{:.1}" x2="{:.1}" y2="{:.1}" stroke="#00b7b7" stroke-width="2.5"/><text x="{center:.1}" y="415" text-anchor="middle">{}</text>"##,
             scale_y(item.min),
             scale_y(item.max),
             center - half,
@@ -949,7 +1174,8 @@ fn render_sankey(data: &Value, items: &[Value]) -> Option<String> {
         node_height[index] = height;
         write!(
             body,
-            r##"<rect x="{x:.1}" y="{y:.1}" width="14" height="{height:.1}" fill="#16a3a5"/><text x="{:.1}" y="{:.1}">{}</text>"##,
+            r#"<rect x="{x:.1}" y="{y:.1}" width="14" height="{height:.1}" fill="{}"/><text x="{:.1}" y="{:.1}">{}</text>"#,
+            SERIES_COLORS[index % SERIES_COLORS.len()],
             x + 20.0,
             y + height / 2.0 + 5.0,
             xml_escape(node)
@@ -972,7 +1198,7 @@ fn render_sankey(data: &Value, items: &[Value]) -> Option<String> {
         let mid_x = f64::midpoint(start_x, end_x);
         write!(
             links,
-            r##"<path d="M {start_x:.1} {start_y:.1} C {mid_x:.1} {start_y:.1}, {mid_x:.1} {end_y:.1}, {end_x:.1} {end_y:.1}" fill="none" stroke="#16a3a5" stroke-opacity=".35" stroke-width="{stroke:.1}"/>"##
+            r##"<path d="M {start_x:.1} {start_y:.1} C {mid_x:.1} {start_y:.1}, {mid_x:.1} {end_y:.1}, {end_x:.1} {end_y:.1}" fill="none" stroke="#94a3b8" stroke-opacity=".35" stroke-width="{stroke:.1}"/>"##
         )
         .expect("writing to a String cannot fail");
     }
@@ -1053,7 +1279,7 @@ fn render_dual_axes(data: &Value) -> Option<String> {
             .join(" ");
         write!(
             body,
-            r##"<path d="{path}" fill="none" stroke="#f59e0b" stroke-width="3"/>"##
+            r##"<path d="{path}" fill="none" stroke="#ffc700" stroke-width="3"/>"##
         )
         .expect("writing to a String cannot fail");
     }
@@ -1071,7 +1297,7 @@ fn render_dual_axes(data: &Value) -> Option<String> {
         let color = if series.kind == "line" {
             "#f59e0b"
         } else {
-            "#16a3a5"
+            "#00b7b7"
         };
         write!(body, r#"<rect x="620" y="{}" width="12" height="12" fill="{color}"/><text x="638" y="{}">{}</text>"#, 60 + index * 25, 71 + index * 25, xml_escape(name)).expect("writing to a String cannot fail");
     }
@@ -1166,7 +1392,15 @@ fn render_tree(data: &Value) -> Option<String> {
     let row_height = 330.0 / usize_as_f64(leaves);
     let mut next_leaf = 0_usize;
     let mut body = String::new();
-    layout_tree(&tree, 0, x_step, row_height, &mut next_leaf, &mut body);
+    layout_tree(
+        &tree,
+        0,
+        x_step,
+        row_height,
+        &mut next_leaf,
+        &mut body,
+        None,
+    );
     Some(svg_shell(data, &body))
 }
 
@@ -1193,20 +1427,32 @@ fn layout_tree(
     row_height: f64,
     next_leaf: &mut usize,
     body: &mut String,
+    color: Option<&str>,
 ) -> f64 {
     let x = 70.0 + usize_as_f64(depth) * x_step;
     let mut child_positions = Vec::new();
-    for child in &node.children {
+    for (child_index, child) in node.children.iter().enumerate() {
         if *next_leaf >= MAX_TREE_LEAVES {
             break;
         }
-        child_positions.push(layout_tree(
-            child,
-            depth + 1,
-            x_step,
-            row_height,
-            next_leaf,
-            body,
+        // Each first-level branch gets its own palette colour (the web
+        // fishbone/mind-map look); deeper nodes inherit their branch colour.
+        let child_color = if depth == 0 {
+            Some(SERIES_COLORS[child_index % SERIES_COLORS.len()])
+        } else {
+            color
+        };
+        child_positions.push((
+            layout_tree(
+                child,
+                depth + 1,
+                x_step,
+                row_height,
+                next_leaf,
+                body,
+                child_color,
+            ),
+            child_color,
         ));
     }
     let y = if child_positions.is_empty() {
@@ -1216,21 +1462,22 @@ fn layout_tree(
     } else {
         let first = child_positions
             .iter()
-            .copied()
+            .map(|(y, _)| *y)
             .fold(f64::INFINITY, f64::min);
         let last = child_positions
             .iter()
-            .copied()
+            .map(|(y, _)| *y)
             .fold(f64::NEG_INFINITY, f64::max);
         let y = f64::midpoint(first, last);
         let child_x = 70.0 + usize_as_f64(depth + 1) * x_step;
         let mid_x = f64::midpoint(x, child_x);
-        for child_y in &child_positions {
+        for (child_y, child_color) in &child_positions {
             write!(
                 body,
-                r#"<path class="edge" d="M {:.1} {y:.1} C {mid_x:.1} {y:.1}, {mid_x:.1} {child_y:.1}, {:.1} {child_y:.1}"/>"#,
+                r#"<path d="M {:.1} {y:.1} C {mid_x:.1} {y:.1}, {mid_x:.1} {child_y:.1}, {:.1} {child_y:.1}" fill="none" stroke="{}" stroke-width="1.5"/>"#,
                 x + 6.0,
-                child_x - 6.0
+                child_x - 6.0,
+                child_color.unwrap_or("#94a3b8")
             )
             .expect("writing to a String cannot fail");
         }
@@ -1238,7 +1485,8 @@ fn layout_tree(
     };
     write!(
         body,
-        r##"<circle cx="{x:.1}" cy="{y:.1}" r="4" fill="#16a3a5"/><text x="{:.1}" y="{:.1}">{}</text>"##,
+        r#"<circle cx="{x:.1}" cy="{y:.1}" r="4" fill="{}"/><text x="{:.1}" y="{:.1}">{}</text>"#,
+        color.unwrap_or("#00b7b7"),
         x + 10.0,
         y + 5.0,
         xml_escape(&node.name)
@@ -1339,7 +1587,7 @@ fn render_network(data: &Value) -> Option<String> {
         let label_x = if x < cx - 1.0 { x - 12.0 } else { x + 12.0 };
         write!(
             body,
-            r##"<circle cx="{x:.1}" cy="{y:.1}" r="7" fill="#16a3a5"/><text x="{label_x:.1}" y="{:.1}" text-anchor="{anchor}">{}</text>"##,
+            r##"<circle cx="{x:.1}" cy="{y:.1}" r="7" fill="#00b7b7"/><text x="{label_x:.1}" y="{:.1}" text-anchor="{anchor}">{}</text>"##,
             y + 5.0,
             xml_escape(node)
         )
