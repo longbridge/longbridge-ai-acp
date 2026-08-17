@@ -261,7 +261,8 @@ fn render_columns(data: &Value, points: &[(String, f64)]) -> String {
         let height = value.abs() / max * 300.0;
         let x = 70.0 + usize_as_f64(index) * width;
         let y = 390.0 - height;
-        write!(body, r#"<rect class="mark" x="{x:.1}" y="{y:.1}" width="{:.1}" height="{height:.1}"/><text x="{:.1}" y="415" text-anchor="middle">{}</text>"#, (width - 12.0).max(2.0), x + (width - 12.0).max(2.0) / 2.0, xml_escape(label)).expect("writing to a String cannot fail");
+        let fill = SERIES_COLORS[index % SERIES_COLORS.len()];
+        write!(body, r#"<rect fill="{fill}" x="{x:.1}" y="{y:.1}" width="{:.1}" height="{height:.1}"/><text x="{:.1}" y="415" text-anchor="middle">{}</text>"#, (width - 12.0).max(2.0), x + (width - 12.0).max(2.0) / 2.0, xml_escape(label)).expect("writing to a String cannot fail");
     }
     svg_shell(data, &body)
 }
@@ -277,7 +278,8 @@ fn render_bars(data: &Value, points: &[(String, f64)]) -> String {
     for (index, (label, value)) in points.iter().enumerate() {
         let width = value.abs() / max * 560.0;
         let y = 60.0 + usize_as_f64(index) * height;
-        write!(body, r#"<text x="150" y="{:.1}" text-anchor="end">{}</text><rect class="mark" x="165" y="{y:.1}" width="{width:.1}" height="{:.1}"/>"#, y + height * 0.55, xml_escape(label), (height - 8.0).max(2.0)).expect("writing to a String cannot fail");
+        let fill = SERIES_COLORS[index % SERIES_COLORS.len()];
+        write!(body, r#"<text x="150" y="{:.1}" text-anchor="end">{}</text><rect fill="{fill}" x="165" y="{y:.1}" width="{width:.1}" height="{:.1}"/>"#, y + height * 0.55, xml_escape(label), (height - 8.0).max(2.0)).expect("writing to a String cannot fail");
     }
     svg_shell(data, &body)
 }
@@ -443,7 +445,7 @@ fn render_radar(data: &Value, items: &[Value]) -> Option<String> {
         .expect("writing to a String cannot fail");
     }
     for (group_index, group) in groups.iter().enumerate() {
-        let polygon = axes
+        let vertices = axes
             .iter()
             .enumerate()
             .map(|(index, axis)| {
@@ -453,20 +455,30 @@ fn render_radar(data: &Value, items: &[Value]) -> Option<String> {
                     .unwrap_or_default();
                 let scaled = value.abs() / max * radius;
                 let angle = axis_angle(index);
-                format!(
-                    "{:.1},{:.1}",
-                    cx + scaled * angle.cos(),
-                    cy + scaled * angle.sin()
-                )
+                (cx + scaled * angle.cos(), cy + scaled * angle.sin())
             })
+            .collect::<Vec<_>>();
+        let polygon = vertices
+            .iter()
+            .map(|(x, y)| format!("{x:.1},{y:.1}"))
             .collect::<Vec<_>>()
             .join(" ");
         let color = SERIES_COLORS[group_index % SERIES_COLORS.len()];
         write!(
             body,
-            r#"<polygon points="{polygon}" fill="{color}" fill-opacity=".25" stroke="{color}" stroke-width="2"/>"#
+            r#"<polygon points="{polygon}" fill="{color}" fill-opacity=".22" stroke="{color}" stroke-width="2"/>"#
         )
         .expect("writing to a String cannot fail");
+        // Colour each vertex by its axis, so a single-series radar is not one flat
+        // teal shape — every spoke's value reads in its own colour.
+        for (index, (x, y)) in vertices.iter().enumerate() {
+            let dot = SERIES_COLORS[index % SERIES_COLORS.len()];
+            write!(
+                body,
+                r#"<circle cx="{x:.1}" cy="{y:.1}" r="4.5" fill="{dot}"/>"#
+            )
+            .expect("writing to a String cannot fail");
+        }
         if groups.len() > 1 && !group.is_empty() {
             write!(body, r#"<rect x="700" y="{}" width="12" height="12" fill="{color}"/><text x="718" y="{}">{}</text>"#, 70 + group_index * 25, 81 + group_index * 25, xml_escape(group)).expect("writing to a String cannot fail");
         }
