@@ -37,6 +37,44 @@ impl From<&str> for Prompt {
     }
 }
 
+/// The `_meta` map of a content block, whichever variant it is.
+pub(crate) fn block_meta(
+    block: &ContentBlock,
+) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    match block {
+        ContentBlock::Text(content) => content.meta.as_ref(),
+        ContentBlock::Image(content) => content.meta.as_ref(),
+        ContentBlock::Audio(content) => content.meta.as_ref(),
+        ContentBlock::ResourceLink(content) => content.meta.as_ref(),
+        ContentBlock::Resource(content) => content.meta.as_ref(),
+        _ => None,
+    }
+}
+
+/// The payload a sender stored under [`ATTACHMENT_META_KEY`], or `None` if the
+/// block is not an attachment.
+///
+/// [`Prompt::attachments`] hands back the blocks verbatim, so the payload lives
+/// in `_meta` under a key whose position differs per `ContentBlock` variant.
+/// This is the supported way to read it: a backend that matches the variants
+/// itself will silently miss any variant added later, and the two sides would
+/// drift on what the envelope looks like.
+///
+/// ```
+/// use agent_client_protocol::schema::v1::{ContentBlock, ResourceLink};
+/// use longbridge_ai_acp::{attachment_payload, ATTACHMENT_META_KEY};
+///
+/// let mut meta = serde_json::Map::new();
+/// meta.insert(ATTACHMENT_META_KEY.into(), serde_json::json!({"oss_key": "k1"}));
+/// let block = ContentBlock::ResourceLink(ResourceLink::new("chart.png", "oss://k1").meta(meta));
+///
+/// assert_eq!(attachment_payload(&block).unwrap()["oss_key"], "k1");
+/// ```
+#[must_use]
+pub fn attachment_payload(block: &ContentBlock) -> Option<&serde_json::Value> {
+    block_meta(block)?.get(ATTACHMENT_META_KEY)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AgentPlanEntry {
     pub content: String,
@@ -197,4 +235,46 @@ pub trait AgentBackend: Send + Sync + 'static {
         prompt: Prompt,
         cwd: &Path,
     ) -> Result<BoxStream<'static, Result<AgentEvent<Self::Session>, BackendError>>, BackendError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{attachment_payload, ATTACHMENT_META_KEY};
+    use agent_client_protocol::schema::v1::{ContentBlock, ResourceLink, TextContent};
+
+    fn meta(key: &str) -> serde_json::Map<String, serde_json::Value> {
+        let mut meta = serde_json::Map::new();
+        meta.insert(key.to_owned(), serde_json::json!({ "oss_key": "k1" }));
+        meta
+    }
+
+    #[test]
+    fn attachment_payload_reads_the_marked_meta_of_every_carrying_variant() {
+        let link = ContentBlock::ResourceLink(
+            ResourceLink::new("chart.png", "oss://k1").meta(meta(ATTACHMENT_META_KEY)),
+        );
+        assert_eq!(
+            attachment_payload(&link),
+            Some(&serde_json::json!({ "oss_key": "k1" }))
+        );
+
+        let text = ContentBlock::Text(TextContent::new("hi").meta(meta(ATTACHMENT_META_KEY)));
+        assert_eq!(
+            attachment_payload(&text),
+            Some(&serde_json::json!({ "oss_key": "k1" }))
+        );
+    }
+
+    #[test]
+    fn attachment_payload_ignores_blocks_that_are_not_attachments() {
+        // No `_meta` at all.
+        assert_eq!(
+            attachment_payload(&ContentBlock::Text(TextContent::new("hi"))),
+            None
+        );
+        // `_meta` present, but under a different key: this is the case a caller
+        // matching variants by hand tends to get wrong.
+        let other = ContentBlock::Text(TextContent::new("hi").meta(meta("longbridge.ai/event")));
+        assert_eq!(attachment_payload(&other), None);
+    }
 }

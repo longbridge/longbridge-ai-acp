@@ -1,6 +1,6 @@
 use crate::{
-    rich_content::chart_markdown_fallback, AgentBackend, AgentEvent, Prompt, RichContent,
-    ATTACHMENT_META_KEY,
+    backend::attachment_payload, rich_content::chart_markdown_fallback, AgentBackend, AgentEvent,
+    Prompt, RichContent,
 };
 use agent_client_protocol::schema::{
     v1::{
@@ -42,19 +42,8 @@ fn standard_rich_chunks(
         .collect()
 }
 
-fn block_meta(block: &ContentBlock) -> Option<&serde_json::Map<String, serde_json::Value>> {
-    match block {
-        ContentBlock::Text(content) => content.meta.as_ref(),
-        ContentBlock::Image(content) => content.meta.as_ref(),
-        ContentBlock::Audio(content) => content.meta.as_ref(),
-        ContentBlock::ResourceLink(content) => content.meta.as_ref(),
-        ContentBlock::Resource(content) => content.meta.as_ref(),
-        _ => None,
-    }
-}
-
 fn is_attachment(block: &ContentBlock) -> bool {
-    block_meta(block).is_some_and(|meta| meta.contains_key(ATTACHMENT_META_KEY))
+    attachment_payload(block).is_some()
 }
 
 /// Splits a prompt into flattened text and attachment blocks.
@@ -601,10 +590,15 @@ pub fn acp_agent_with_auth_methods<B: AgentBackend>(
                                 error = %error,
                                 "ACP backend rejected prompt; ending turn without failing the connection"
                             );
-                            send_agent_text(
+                            let error_message = error.to_string();
+                            task_connection.send_notification(SessionNotification::new(
+                                request.session_id.clone(),
+                                turn_failed_update(&error_message, "prompt"),
+                            ))?;
+                            send_agent_fallback_text(
                                 &task_connection,
                                 &request.session_id,
-                                format!("\nThe request could not be completed: {error}\n"),
+                                format!("\nThe request could not be completed: {error_message}\n"),
                             )?;
                             return Ok(PromptResponse::new(StopReason::EndTurn));
                         }
@@ -644,7 +638,7 @@ pub fn acp_agent_with_auth_methods<B: AgentBackend>(
                                         timed_out_tools,
                                     ),
                                 ))?;
-                                send_agent_text(&task_connection, &request.session_id, "\nThe backend stopped responding for 60 seconds. The current operation was timed out so this ACP turn can finish.\n".to_string())?;
+                                send_agent_fallback_text(&task_connection, &request.session_id, "\nThe backend stopped responding for 60 seconds. The current operation was timed out so this ACP turn can finish.\n".to_string())?;
                                 break;
                             }
                         };
@@ -668,10 +662,17 @@ pub fn acp_agent_with_auth_methods<B: AgentBackend>(
                                     error = %error,
                                     "ACP backend event stream failed; ending turn without failing the connection"
                                 );
-                                send_agent_text(
+                                let error_message = error.to_string();
+                                task_connection.send_notification(SessionNotification::new(
+                                    request.session_id.clone(),
+                                    turn_failed_update(&error_message, "stream"),
+                                ))?;
+                                send_agent_fallback_text(
                                     &task_connection,
                                     &request.session_id,
-                                    format!("\nThe response was interrupted by an error: {error}\n"),
+                                    format!(
+                                        "\nThe response was interrupted by an error: {error_message}\n"
+                                    ),
                                 )?;
                                 break;
                             }
@@ -783,7 +784,7 @@ pub fn acp_agent_with_auth_methods<B: AgentBackend>(
                                     )),
                                 ))?;
                                 if let Some(failure) = failure {
-                                    send_agent_text(
+                                    send_agent_fallback_text(
                                         &task_connection,
                                         &request.session_id,
                                         failure,
@@ -837,7 +838,7 @@ pub fn acp_agent_with_auth_methods<B: AgentBackend>(
                                     ),
                                 ))?;
                                 if let Some(failure) = failure {
-                                    send_agent_text(
+                                    send_agent_fallback_text(
                                         &task_connection,
                                         &request.session_id,
                                         failure,
@@ -1121,16 +1122,25 @@ pub fn acp_agent_with_auth_methods<B: AgentBackend>(
         )
 }
 
-fn send_agent_text(
+/// Host-generated English that always has a machine-readable counterpart: a
+/// `backend_timeout` or `turn_failed` envelope for turn outcomes, and the
+/// preceding `ToolCallUpdate` (`status: failed`, `title`, `raw_output`) for a
+/// tool failure. Marked as a standard fallback so clients that read the
+/// structured form can drop the sentence instead of rendering hard-coded
+/// English as model output.
+///
+/// Every sentence this crate writes itself goes through here — there is
+/// deliberately no unmarked counterpart.
+fn send_agent_fallback_text(
     connection: &ConnectionTo<Client>,
     session_id: &SessionId,
     text: String,
 ) -> agent_client_protocol::Result<()> {
     connection.send_notification(SessionNotification::new(
         session_id.clone(),
-        SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(TextContent::new(
-            text,
-        )))),
+        SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+            TextContent::new(text).meta(standard_fallback_meta()),
+        ))),
     ))
 }
 
@@ -1141,6 +1151,38 @@ fn backend_timeout_update(timeout_seconds: u64, active_tools: usize) -> SessionU
             "data": {
                 "timeout_seconds": timeout_seconds,
                 "active_tools": active_tools,
+            },
+        }))),
+    )))
+}
+
+/// Machine-readable marker for a turn that ended in failure.
+///
+/// `StopReason` lives in the external schema crate and cannot carry this
+/// distinction, so a failed turn still ends with `StopReason::EndTurn`. The
+/// envelope is what tells a client the turn failed.
+///
+/// `phase` says what the client should do with the transcript:
+/// `"prompt"` means the backend never took the turn (nothing of it was
+/// rendered), `"stream"` means part of an answer already rendered and the
+/// failure must be appended to it, and `"prompt_response"` (emitted client-side
+/// by [`crate::DesktopSession`]) means the prompt request itself was answered
+/// with a JSON-RPC error. In this crate the main source of that last case is a
+/// failed permission resume: [`AgentEvent::PermissionRequired`] returns the
+/// backend error as the JSON-RPC error response to the prompt request rather
+/// than as a notification, so no server-side envelope is emitted for it.
+///
+/// The envelope is emitted at the point of failure and is not guaranteed to be
+/// the last content notification of the turn — in the `"stream"` phase the
+/// rich-text filter still flushes its buffered residue afterwards. Treat it as
+/// "this turn failed", not as "no more content follows".
+pub(crate) fn turn_failed_update(error_message: &str, phase: &str) -> SessionUpdate {
+    SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+        TextContent::new(String::new()).meta(longbridge_meta(serde_json::json!({
+            "event": "turn_failed",
+            "data": {
+                "error_message": error_message,
+                "phase": phase,
             },
         }))),
     )))
@@ -1882,6 +1924,10 @@ mod tests {
 
     struct RejectingBackend;
 
+    struct FailingStreamBackend;
+
+    struct FailingToolBackend;
+
     struct MarkdownChartBackend;
 
     struct StructuredEventsBackend;
@@ -2440,6 +2486,51 @@ mod tests {
     }
 
     #[async_trait]
+    impl AgentBackend for FailingStreamBackend {
+        type Session = ();
+
+        async fn prompt(
+            &self,
+            _session: (),
+            _prompt: Prompt,
+            _cwd: &Path,
+        ) -> Result<BoxStream<'static, Result<AgentEvent<()>, BackendError>>, BackendError>
+        {
+            Ok(Box::pin(stream::iter([Err(
+                "upstream 401004 NoLogin".into()
+            )])))
+        }
+    }
+
+    #[async_trait]
+    impl AgentBackend for FailingToolBackend {
+        type Session = ();
+
+        async fn prompt(
+            &self,
+            session: (),
+            _prompt: Prompt,
+            _cwd: &Path,
+        ) -> Result<BoxStream<'static, Result<AgentEvent<()>, BackendError>>, BackendError>
+        {
+            Ok(Box::pin(stream::iter([
+                Ok(AgentEvent::ToolStarted {
+                    id: "tool-1".into(),
+                    title: "Quote".into(),
+                    raw_input: None,
+                }),
+                Ok(AgentEvent::ToolFinished {
+                    id: "tool-1".into(),
+                    title: "Quote".into(),
+                    success: false,
+                    raw_output: Some(serde_json::json!({ "error": "not entitled" })),
+                }),
+                Ok(AgentEvent::Finished(session)),
+            ])))
+        }
+    }
+
+    #[async_trait]
     impl AgentBackend for MarkdownChartBackend {
         type Session = ();
 
@@ -2634,6 +2725,187 @@ mod tests {
 
         assert_eq!(response.0.stop_reason, StopReason::EndTurn);
         assert_eq!(response.1.protocol_version, ProtocolVersion::V1);
+    }
+
+    fn text_chunk(update: &SessionUpdate) -> Option<&TextContent> {
+        match update {
+            SessionUpdate::AgentMessageChunk(chunk) => match &chunk.content {
+                ContentBlock::Text(text) => Some(text),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn longbridge_event(update: &SessionUpdate) -> Option<serde_json::Value> {
+        text_chunk(update)?
+            .meta
+            .as_ref()?
+            .get("longbridge.ai/event")
+            .cloned()
+    }
+
+    fn is_standard_fallback(update: &SessionUpdate) -> bool {
+        text_chunk(update)
+            .and_then(|text| text.meta.as_ref())
+            .and_then(|meta| meta.get("longbridge.ai/standard-fallback"))
+            == Some(&serde_json::json!(true))
+    }
+
+    fn turn_failed_envelopes(updates: &[SessionUpdate]) -> Vec<serde_json::Value> {
+        updates
+            .iter()
+            .filter_map(longbridge_event)
+            .filter(|event| event["event"] == "turn_failed")
+            .collect()
+    }
+
+    /// Drive one prompt through a real ACP connection and return the response
+    /// together with the notifications the client had already received when
+    /// that response arrived.
+    async fn collect_prompt_updates<B: AgentBackend>(
+        backend: B,
+    ) -> (PromptResponse, Vec<SessionUpdate>) {
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let received = Arc::clone(&updates);
+        let snapshot = Arc::clone(&updates);
+        agent_client_protocol::Client
+            .builder()
+            .on_receive_notification(
+                async move |notification: SessionNotification, _cx| {
+                    received.lock().expect("mutex").push(notification.update);
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(acp_agent(backend), async move |connection| {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let session = connection
+                    .send_request(NewSessionRequest::new(std::path::PathBuf::from("/tmp")))
+                    .block_task()
+                    .await?;
+                let response = connection
+                    .send_request(PromptRequest::new(
+                        session.session_id,
+                        vec![ContentBlock::Text(TextContent::new("hello"))],
+                    ))
+                    .block_task()
+                    .await?;
+                // Snapshot here, not after the connection closes: the envelope
+                // has to reach the client no later than the prompt response.
+                let seen = snapshot.lock().expect("mutex").clone();
+                Ok((response, seen))
+            })
+            .await
+            .expect("ACP connection should remain available")
+    }
+
+    #[tokio::test]
+    async fn rejected_prompt_reports_a_machine_readable_failure() {
+        let (response, updates) = collect_prompt_updates(RejectingBackend).await;
+
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+
+        let envelopes = turn_failed_envelopes(&updates);
+        assert_eq!(envelopes.len(), 1);
+        assert_eq!(envelopes[0]["data"]["phase"], "prompt");
+        assert_eq!(
+            envelopes[0]["data"]["error_message"],
+            "Authentication required"
+        );
+
+        // The sentence that carries the same information is marked, and it
+        // carries exactly the error text the envelope reports.
+        let sentence = updates
+            .iter()
+            .find(|update| is_standard_fallback(update))
+            .and_then(text_chunk)
+            .expect("a marked fallback sentence");
+        assert!(sentence.text.contains("Authentication required"));
+
+        // The differential half: the same collector over a healthy backend must
+        // produce zero turn_failed envelopes and zero marked sentences.
+        let (_, success_updates) = collect_prompt_updates(MockBackend::default()).await;
+        assert!(turn_failed_envelopes(&success_updates).is_empty());
+        assert!(!success_updates.iter().any(is_standard_fallback));
+    }
+
+    /// A failed tool already has a machine-readable form — the `ToolCallUpdate`
+    /// that precedes the sentence carries the status, title and raw output — so
+    /// the sentence is a fallback by the same rule as the turn-outcome ones.
+    #[tokio::test]
+    async fn failed_tool_sentence_is_marked_as_a_standard_fallback() {
+        let (response, updates) = collect_prompt_updates(FailingToolBackend).await;
+
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+
+        // The structured counterpart the client is meant to read instead.
+        let failed = updates.iter().position(|update| {
+            matches!(
+                update,
+                SessionUpdate::ToolCallUpdate(update)
+                    if update.fields.status == Some(ToolCallStatus::Failed)
+            )
+        });
+        let failed = failed.expect("a failed ToolCallUpdate");
+
+        let sentence = updates
+            .iter()
+            .skip(failed + 1)
+            .find_map(|update| text_chunk(update).map(|text| (update, text)))
+            .expect("a sentence after the failed tool call");
+        assert!(sentence.1.text.contains("not entitled"));
+        assert!(
+            is_standard_fallback(sentence.0),
+            "the host-written tool failure sentence must be marked so clients can localize it"
+        );
+    }
+
+    #[tokio::test]
+    async fn mid_stream_failure_reports_a_machine_readable_failure() {
+        let (response, updates) = collect_prompt_updates(FailingStreamBackend).await;
+
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+
+        let envelopes = turn_failed_envelopes(&updates);
+        assert_eq!(envelopes.len(), 1);
+        assert_eq!(envelopes[0]["data"]["phase"], "stream");
+        assert_eq!(
+            envelopes[0]["data"]["error_message"],
+            "upstream 401004 NoLogin"
+        );
+
+        let sentence = updates
+            .iter()
+            .find(|update| is_standard_fallback(update))
+            .and_then(text_chunk)
+            .expect("a marked fallback sentence");
+        assert!(sentence.text.contains("upstream 401004 NoLogin"));
+    }
+
+    /// `start_paused` auto-advances the clock whenever every task is idle,
+    /// which `SlowBackend`'s `stream::pending()` guarantees. Without it the
+    /// timeout branch would need a real `BACKEND_INACTIVITY_TIMEOUT` minute and
+    /// stays untested, as it was until now.
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_turn_marks_its_sentence_as_a_standard_fallback() {
+        let (response, updates) = collect_prompt_updates(SlowBackend).await;
+
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+
+        let timeout = updates
+            .iter()
+            .position(|update| {
+                longbridge_event(update).is_some_and(|event| event["event"] == "backend_timeout")
+            })
+            .expect("a backend_timeout envelope");
+        assert!(
+            is_standard_fallback(&updates[timeout + 1]),
+            "the sentence after the backend_timeout envelope must be marked"
+        );
     }
 
     #[tokio::test]

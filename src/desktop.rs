@@ -312,8 +312,31 @@ async fn drive_turn(
                 }
             },
             outcome = &mut stop_rx => {
-                let reason = outcome
-                    .map_err(|_| agent_client_protocol::Error::internal_error())??;
+                let reason = match outcome {
+                    Ok(Ok(reason)) => reason,
+                    // An error *response* ends this turn, not this session.
+                    // Report it the way the server reports its own turn
+                    // failures and finish the turn normally, so the session
+                    // keeps serving commands.
+                    Ok(Err(error)) => {
+                        tracing::error!(
+                            target: "longbridge_ai_acp::desktop",
+                            session_id = %session.session_id().0,
+                            error = %error,
+                            "ACP prompt request failed; ending the turn without ending the session"
+                        );
+                        let _ = events.send(DesktopSessionEvent::Update(Box::new(
+                            crate::server::turn_failed_update(
+                                &error.to_string(),
+                                "prompt_response",
+                            ),
+                        )));
+                        StopReason::EndTurn
+                    }
+                    // The callback is dropped without ever firing only when the
+                    // connection is gone; that is a session-level failure.
+                    Err(_) => return Err(agent_client_protocol::Error::internal_error()),
+                };
                 let _ = events.send(DesktopSessionEvent::TurnFinished(reason));
                 return Ok(true);
             }
@@ -346,9 +369,17 @@ mod tests {
     use futures::{stream, stream::BoxStream};
     use serde_json::Map;
     use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct Echo;
     struct Slow;
+
+    /// Asks for permission on the first prompt, then fails the resume. That
+    /// resume is the one place a backend failure still leaves the turn as a
+    /// JSON-RPC error *response* (`server.rs`, `AgentEvent::PermissionRequired`),
+    /// which is what a `DesktopSession` has to survive.
+    #[derive(Default)]
+    struct FailingResume(AtomicUsize);
 
     #[async_trait]
     impl AgentBackend for Echo {
@@ -385,6 +416,70 @@ mod tests {
         {
             Ok(Box::pin(stream::pending()))
         }
+    }
+
+    #[async_trait]
+    impl AgentBackend for FailingResume {
+        type Session = ();
+
+        async fn prompt(
+            &self,
+            _session: (),
+            _prompt: Prompt,
+            _cwd: &Path,
+        ) -> Result<BoxStream<'static, Result<AgentEvent<()>, BackendError>>, BackendError>
+        {
+            if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(Box::pin(stream::iter([Ok(
+                    AgentEvent::PermissionRequired {
+                        session: (),
+                        tool_call_id: "tool-1".to_string(),
+                        title: "Place an order".to_string(),
+                        metadata: None,
+                    },
+                )])))
+            } else {
+                Err("resume rejected: 401004 NoLogin".into())
+            }
+        }
+    }
+
+    /// Collect events until the turn ends, so the test never blocks on a
+    /// session that (wrongly) died instead of finishing the turn.
+    async fn drain_turn(session: &mut DesktopSession) -> Vec<DesktopSessionEvent> {
+        let mut collected = Vec::new();
+        loop {
+            let event =
+                tokio::time::timeout(std::time::Duration::from_secs(5), session.next_event())
+                    .await
+                    .expect("the turn must terminate");
+            match event {
+                Some(event @ DesktopSessionEvent::TurnFinished(_)) => {
+                    collected.push(event);
+                    return collected;
+                }
+                Some(event) => collected.push(event),
+                None => return collected,
+            }
+        }
+    }
+
+    fn turn_failed_envelope(event: &DesktopSessionEvent) -> Option<serde_json::Value> {
+        let DesktopSessionEvent::Update(update) = event else {
+            return None;
+        };
+        let SessionUpdate::AgentMessageChunk(ContentChunk {
+            content: ContentBlock::Text(text),
+            ..
+        }) = &**update
+        else {
+            return None;
+        };
+        text.meta
+            .as_ref()?
+            .get("longbridge.ai/event")
+            .filter(|event| event["event"] == "turn_failed")
+            .cloned()
     }
 
     #[tokio::test]
@@ -491,6 +586,53 @@ mod tests {
             session.next_event().await,
             Some(DesktopSessionEvent::TurnFinished(StopReason::Cancelled))
         ));
+        session.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_prompt_response_ends_the_turn_not_the_session() {
+        let mut session = DesktopSession::connect(
+            acp_agent(FailingResume::default()),
+            "/tmp",
+            Arc::new(DenyPermissions),
+        )
+        .await
+        .expect("desktop session");
+
+        session.prompt("place it").await.expect("accepted prompt");
+        let events = drain_turn(&mut session).await;
+
+        // The session survives: no Failed, and the turn still terminates.
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, DesktopSessionEvent::Failed(_))),
+            "a failed turn must not be reported as a dead session: {events:?}"
+        );
+        assert!(matches!(
+            events.last(),
+            Some(DesktopSessionEvent::TurnFinished(StopReason::EndTurn))
+        ));
+
+        // The failure is visible as an envelope, not only in a log line.
+        let envelope = events
+            .iter()
+            .find_map(turn_failed_envelope)
+            .expect("a turn_failed envelope");
+        assert_eq!(envelope["data"]["phase"], "prompt_response");
+        assert!(envelope["data"]["error_message"]
+            .as_str()
+            .expect("an error message")
+            .contains("resume rejected: 401004 NoLogin"));
+
+        // And the same session still accepts and completes another turn.
+        session.prompt("try again").await.expect("second prompt");
+        let next = drain_turn(&mut session).await;
+        assert!(matches!(
+            next.last(),
+            Some(DesktopSessionEvent::TurnFinished(StopReason::EndTurn))
+        ));
+
         session.shutdown().await;
     }
 }
